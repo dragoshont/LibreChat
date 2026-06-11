@@ -19,6 +19,7 @@ const {
   injectSkillPrimes,
   extractManualSkills,
   recordCollectedUsage,
+  createSubagentUsageSink,
   getTransactionsConfig,
   findPiiMatchInMessages,
   discoverConnectedAgents,
@@ -746,6 +747,9 @@ const createResponse = async (req, res) => {
           conversationId,
         },
         user: { id: userId },
+        /** Bills subagent child-run model calls (reported outside the
+         *  streamEvents loop) into the same collectedUsage array. */
+        subagentUsageSink: createSubagentUsageSink(collectedUsage),
       });
 
       if (!run) {
@@ -918,6 +922,9 @@ const createResponse = async (req, res) => {
           conversationId,
         },
         user: { id: userId },
+        /** Bills subagent child-run model calls (reported outside the
+         *  streamEvents loop) into the same collectedUsage array. */
+        subagentUsageSink: createSubagentUsageSink(collectedUsage),
       });
 
       if (!run) {
