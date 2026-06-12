@@ -174,6 +174,70 @@ async function saveMemory(userId, key, value) {
   }
 }
 
+// --- Web search over voice (FREE, in-cluster SearXNG) ------------------------
+// Voice users asked "what's the score / latest news" and got "I have no
+// internet" because the realtime model has NO tools by default. This gives it a
+// read-only web_search tool backed by the in-cluster SearXNG (no API key,
+// reachable via the allow-librechat-to-searxng NetworkPolicy). Enabled by
+// REALTIME_WEB_SEARCH=true; the SearXNG URL reuses SEARXNG_INSTANCE_URL (already
+// set on the deployment for LibreChat's native text web search). The schema is
+// hand-written clean (additionalProperties:false, no anyOf) so Azure realtime
+// accepts it (see the rt8 sanitize lesson).
+const WEB_SEARCH_ENABLED = (process.env.REALTIME_WEB_SEARCH || 'false').toLowerCase() === 'true';
+const WEB_SEARCH_URL = (process.env.SEARXNG_INSTANCE_URL || '').replace(/\/+$/, '');
+const WEB_SEARCH_MAX_RESULTS = parseInt(process.env.REALTIME_WEB_SEARCH_RESULTS || '6', 10);
+
+const WEB_SEARCH_TOOL = {
+  type: 'function',
+  name: 'web_search',
+  description:
+    'Search the public web for current, real-world information (news, sports '
+    + 'scores, events, prices, recent facts). Returns the top result titles, '
+    + 'URLs and snippets. Use this whenever the user asks about something recent, '
+    + 'time-sensitive, or that you are not certain about.',
+  parameters: {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      query: {
+        type: 'string',
+        description: 'The search query, e.g. "FIFA World Cup 2026 results".',
+      },
+    },
+    required: ['query'],
+  },
+};
+
+async function searchWeb(query) {
+  const q = (query || '').trim();
+  if (!q) {
+    return 'No search query provided.';
+  }
+  if (!WEB_SEARCH_URL) {
+    return 'Web search is not configured.';
+  }
+  try {
+    const r = await axios.get(`${WEB_SEARCH_URL}/search`, {
+      params: { q, format: 'json', safesearch: 1 },
+      timeout: 15000,
+    });
+    const results = Array.isArray(r.data?.results) ? r.data.results : [];
+    if (!results.length) {
+      return `No web results for "${q}".`;
+    }
+    const lines = results.slice(0, WEB_SEARCH_MAX_RESULTS).map((x, i) => {
+      const title = (x.title || '').trim();
+      const url = (x.url || '').trim();
+      const snippet = (x.content || '').trim().replace(/\s+/g, ' ').slice(0, 300);
+      return `${i + 1}. ${title}\n   ${url}\n   ${snippet}`;
+    });
+    return `Top web results for "${q}":\n` + lines.join('\n');
+  } catch (err) {
+    logger.warn(`[realtime] web_search failed: ${err.message}`);
+    return 'Web search is unavailable right now.';
+  }
+}
+
 let toolDefs = [];
 let toolDispatch = {}; // name -> { url, path }
 let toolsLoaded = false;
@@ -332,7 +396,7 @@ router.get('/config', async (req, res) => {
     enabled: isEnabled(),
     deployment: AZURE_REALTIME_DEPLOYMENT,
     voice: REALTIME_VOICE,
-    toolCount: toolDefs.length + (MEMORY_ENABLED ? 1 : 0),
+    toolCount: toolDefs.length + (MEMORY_ENABLED ? 1 : 0) + (WEB_SEARCH_ENABLED ? 1 : 0),
     memory: MEMORY_ENABLED,
   });
 });
@@ -378,6 +442,9 @@ router.post('/session', async (req, res) => {
   const tools = toolDefs.slice();
   if (MEMORY_ENABLED) {
     tools.push(MEMORY_TOOL);
+  }
+  if (WEB_SEARCH_ENABLED && WEB_SEARCH_URL) {
+    tools.push(WEB_SEARCH_TOOL);
   }
   if (tools.length) {
     session.tools = tools;
@@ -448,6 +515,25 @@ router.post('/tool', async (req, res) => {
     }
     const output = await saveMemory(req.user?.id, a.key, a.value);
     return res.json({ output });
+  }
+  // Built-in web search (not an MCP server): free in-cluster SearXNG.
+  if (name === 'web_search') {
+    if (!WEB_SEARCH_ENABLED) {
+      return res.status(400).json({ output: 'Web search is not enabled.' });
+    }
+    let a = args;
+    if (typeof a === 'string') {
+      try {
+        a = a.trim() ? JSON.parse(a) : {};
+      } catch {
+        a = {};
+      }
+    }
+    if (!a || typeof a !== 'object') {
+      a = {};
+    }
+    const output = await searchWeb(a.query);
+    return res.json({ output: (output || '').slice(0, TOOL_CALL_CHARS) || 'No data returned.' });
   }
   const target = toolDispatch[name];
   if (!target) {
