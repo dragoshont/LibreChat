@@ -40,6 +40,15 @@ const REALTIME_INSTRUCTIONS =
 
 const isEnabled = () => Boolean(AZURE_REALTIME_ENDPOINT && AZURE_REALTIME_API_KEY);
 
+// A voice conversation must be CONTINUABLE BY TEXT. The realtime answer comes
+// from Azure's speech model, NOT from a routable text-chat endpoint, and the UI
+// endpoint the user happened to be on may be unusable for a typed follow-up
+// (e.g. `agents` with no agent selected → "Something went wrong"). So we
+// attribute persisted voice turns to a KNOWN-GOOD chat endpoint+model that
+// LibreChat can route. Defaults match this deployment's custom LiteLLM endpoint.
+const REALTIME_CHAT_ENDPOINT = process.env.REALTIME_CHAT_ENDPOINT || 'Homelab';
+const REALTIME_CHAT_MODEL = process.env.REALTIME_CHAT_MODEL || 'claude-sonnet-4.6';
+
 // --- Read-only-by-default MCP tool bridge for voice (mirrors voice-gateway) ---
 // The realtime model runs in Azure's cloud and can't reach in-cluster MCP
 // servers; the browser can't either (NetworkPolicy + CORS). So the model emits
@@ -458,18 +467,30 @@ router.post('/transcript', async (req, res) => {
 
   const userId = userMessageId || randomUUID();
   const assistantId = assistantMessageId || randomUUID();
-  // The conversation/message MODEL must stay the user's TEXT chat model so the
-  // chat is continuable by typing. The realtime deployment (gpt-realtime-1-5)
-  // is NOT a routable chat model — writing it here breaks the next typed turn.
-  // So attribution uses ONLY the client-provided chat model, never a realtime
-  // fallback (omit when absent, e.g. agents endpoint where model is null).
-  const convoFields = {
-    ...(endpoint ? { endpoint } : {}),
-    ...(endpointType ? { endpointType } : {}),
-    ...(model ? { model } : {}),
-    ...(agentId ? { agent_id: agentId } : {}),
-    ...(spec ? { spec } : {}),
-  };
+
+  // Decide a ROUTABLE attribution so the conversation is continuable by text.
+  // - A non-"agents" custom endpoint with a model the user was already on is
+  //   kept (e.g. "Homelab" + claude-*).
+  // - "agents" WITH a real agent_id is kept (the agent is routable).
+  // - Anything else (no endpoint, or "agents" with no agent — the voice default,
+  //   which is UNROUTABLE for a typed turn) falls back to the known-good chat
+  //   endpoint+model. Never the realtime speech deployment.
+  const usableCustom = endpoint && endpoint !== 'agents';
+  const usableAgent = endpoint === 'agents' && !!agentId;
+  let attribution;
+  if (usableCustom) {
+    attribution = {
+      endpoint,
+      ...(endpointType ? { endpointType } : {}),
+      model: model || REALTIME_CHAT_MODEL,
+      ...(spec ? { spec } : {}),
+    };
+  } else if (usableAgent) {
+    attribution = { endpoint: 'agents', agent_id: agentId, ...(spec ? { spec } : {}) };
+  } else {
+    attribution = { endpoint: REALTIME_CHAT_ENDPOINT, model: REALTIME_CHAT_MODEL };
+  }
+  const convoFields = { ...attribution };
 
   try {
     let savedUser = false;
@@ -483,7 +504,7 @@ router.post('/transcript', async (req, res) => {
           sender: 'User',
           text: userText.trim(),
           isCreatedByUser: true,
-          ...(endpoint ? { endpoint } : {}),
+          endpoint: attribution.endpoint,
         },
         { context: 'realtime/transcript:user' },
       );
@@ -501,8 +522,8 @@ router.post('/transcript', async (req, res) => {
           sender: 'Assistant',
           text: assistantText.trim(),
           isCreatedByUser: false,
-          ...(model ? { model } : {}),
-          ...(endpoint ? { endpoint } : {}),
+          endpoint: attribution.endpoint,
+          ...(attribution.model ? { model: attribution.model } : {}),
         },
         { context: 'realtime/transcript:assistant' },
       );
