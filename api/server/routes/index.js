@@ -27,11 +27,13 @@ const edit = require('./edit');
 const keys = require('./keys');
 const user = require('./user');
 const mcp = require('./mcp');
+const realtime = require('./realtime');
 
 module.exports = {
   mcp,
   edit,
   auth,
+  realtime,
   keys,
   user,
   tags,

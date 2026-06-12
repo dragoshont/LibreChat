@@ -1,0 +1,356 @@
+import { useCallback, useRef, useState } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
+import { request, Constants, QueryKeys } from 'librechat-data-provider';
+import type { TMessage } from 'librechat-data-provider';
+
+/**
+ * useRealtimeVoice — client-orchestrated WebRTC realtime voice for LibreChat.
+ *
+ * The browser opens a WebRTC peer connection DIRECTLY to Azure OpenAI's realtime
+ * endpoint (lowest latency, P2P audio). This hook:
+ *   1. mints a per-user EPHEMERAL token from our own `/api/realtime/session`
+ *      (the standing Azure key never reaches the browser),
+ *   2. streams mic audio up + model audio down over the peer connection,
+ *   3. reads transcript events off the data channel and renders them LIVE into
+ *      the current conversation (ChatGPT-style), and
+ *   4. persists each completed turn to MongoDB via `/api/realtime/transcript`
+ *      using the SAME message ids it rendered optimistically, so the thread and
+ *      the database never diverge. On stop it reconciles from the DB.
+ *
+ * webrtcfilter=on keeps the system prompt off the browser data channel; the
+ * three transcript events we rely on are still delivered.
+ */
+
+export type RealtimeStatus = 'idle' | 'connecting' | 'listening' | 'speaking' | 'error';
+
+type SessionResponse = {
+  token: string;
+  endpoint: string;
+  deployment: string;
+  webrtcUrl: string;
+  expiresAt: number | null;
+};
+
+interface UseRealtimeVoiceParams {
+  conversationId?: string | null;
+  endpoint?: string | null;
+  model?: string | null;
+  getMessages: () => TMessage[] | undefined;
+  setMessages: (messages: TMessage[]) => void;
+  onError?: (message: string) => void;
+}
+
+const now = () => new Date().toISOString();
+
+export default function useRealtimeVoice({
+  conversationId,
+  endpoint,
+  model,
+  getMessages,
+  setMessages,
+  onError,
+}: UseRealtimeVoiceParams) {
+  const [status, setStatus] = useState<RealtimeStatus>('idle');
+  const [userCaption, setUserCaption] = useState('');
+  const [assistantCaption, setAssistantCaption] = useState('');
+
+  const queryClient = useQueryClient();
+
+  const pcRef = useRef<RTCPeerConnection | null>(null);
+  const dcRef = useRef<RTCDataChannel | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const audioElRef = useRef<HTMLAudioElement | null>(null);
+
+  // The conversation id the turns are written to (generated if we start voice
+  // from a brand-new chat so persistence has a stable target).
+  const convoIdRef = useRef<string>('');
+  // Messages present in the thread when the session started — voice turns are
+  // appended after these so we never clobber prior history.
+  const baseMessagesRef = useRef<TMessage[]>([]);
+  // Voice turns created this session (kept separate for clean re-renders).
+  const turnsRef = useRef<TMessage[]>([]);
+  // Parent-id chain so the thread tree is well-formed.
+  const lastIdRef = useRef<string>(Constants.NO_PARENT);
+
+  // Current in-flight turn bookkeeping.
+  const userTextRef = useRef('');
+  const userIdRef = useRef<string | null>(null);
+  const userParentRef = useRef<string>(Constants.NO_PARENT);
+  const assistantTextRef = useRef('');
+  const assistantIdRef = useRef<string | null>(null);
+
+  const genId = () =>
+    typeof crypto !== 'undefined' && crypto.randomUUID
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+  const render = useCallback(() => {
+    try {
+      setMessages([...baseMessagesRef.current, ...turnsRef.current]);
+    } catch {
+      /* never let a render glitch tear down the session */
+    }
+  }, [setMessages]);
+
+  const upsertTurn = useCallback(
+    (msg: TMessage) => {
+      const idx = turnsRef.current.findIndex((m) => m.messageId === msg.messageId);
+      if (idx >= 0) {
+        turnsRef.current[idx] = msg;
+      } else {
+        turnsRef.current.push(msg);
+      }
+      render();
+    },
+    [render],
+  );
+
+  const makeMessage = useCallback(
+    (opts: { messageId: string; parentMessageId: string; text: string; isCreatedByUser: boolean; unfinished?: boolean }): TMessage =>
+      ({
+        messageId: opts.messageId,
+        conversationId: convoIdRef.current,
+        parentMessageId: opts.parentMessageId,
+        sender: opts.isCreatedByUser ? 'User' : 'Assistant',
+        text: opts.text,
+        isCreatedByUser: opts.isCreatedByUser,
+        error: false,
+        unfinished: opts.unfinished ?? false,
+        createdAt: now(),
+        updatedAt: now(),
+      }) as TMessage,
+    [],
+  );
+
+  const persistTurn = useCallback(
+    async (assistantFinalText: string) => {
+      if (!convoIdRef.current) {
+        return;
+      }
+      try {
+        await request.post('/api/realtime/transcript', {
+          conversationId: convoIdRef.current,
+          userText: userTextRef.current,
+          assistantText: assistantFinalText,
+          userMessageId: userIdRef.current ?? undefined,
+          assistantMessageId: assistantIdRef.current ?? undefined,
+          parentMessageId: userParentRef.current,
+          endpoint: endpoint ?? undefined,
+          model: model ?? undefined,
+        });
+      } catch {
+        /* best-effort; the DB reconcile on stop covers transient failures */
+      }
+    },
+    [endpoint, model],
+  );
+
+  const handleUserTranscript = useCallback(
+    (transcript: string) => {
+      const text = (transcript || '').trim();
+      if (!text) {
+        return;
+      }
+      const id = genId();
+      userIdRef.current = id;
+      userParentRef.current = lastIdRef.current;
+      userTextRef.current = text;
+      lastIdRef.current = id;
+      setUserCaption(text);
+      setAssistantCaption('');
+      upsertTurn(
+        makeMessage({ messageId: id, parentMessageId: userParentRef.current, text, isCreatedByUser: true }),
+      );
+    },
+    [makeMessage, upsertTurn],
+  );
+
+  const handleAssistantDelta = useCallback(
+    (delta: string) => {
+      if (!delta) {
+        return;
+      }
+      setStatus('speaking');
+      if (!assistantIdRef.current) {
+        assistantIdRef.current = genId();
+        assistantTextRef.current = '';
+        // assistant turn is a child of the user turn (or the prior chain head)
+        const parent = userIdRef.current ?? lastIdRef.current;
+        lastIdRef.current = assistantIdRef.current;
+        upsertTurn(
+          makeMessage({
+            messageId: assistantIdRef.current,
+            parentMessageId: parent,
+            text: '',
+            isCreatedByUser: false,
+            unfinished: true,
+          }),
+        );
+      }
+      assistantTextRef.current += delta;
+      setAssistantCaption(assistantTextRef.current);
+      upsertTurn(
+        makeMessage({
+          messageId: assistantIdRef.current,
+          parentMessageId: userIdRef.current ?? Constants.NO_PARENT,
+          text: assistantTextRef.current,
+          isCreatedByUser: false,
+          unfinished: true,
+        }),
+      );
+    },
+    [makeMessage, upsertTurn],
+  );
+
+  const handleAssistantDone = useCallback(
+    (transcript: string) => {
+      const finalText = (transcript || assistantTextRef.current || '').trim();
+      if (assistantIdRef.current) {
+        upsertTurn(
+          makeMessage({
+            messageId: assistantIdRef.current,
+            parentMessageId: userIdRef.current ?? Constants.NO_PARENT,
+            text: finalText,
+            isCreatedByUser: false,
+            unfinished: false,
+          }),
+        );
+      }
+      void persistTurn(finalText);
+      // reset for the next turn
+      userIdRef.current = null;
+      userTextRef.current = '';
+      assistantIdRef.current = null;
+      assistantTextRef.current = '';
+      setStatus('listening');
+    },
+    [makeMessage, upsertTurn, persistTurn],
+  );
+
+  const onDataChannelMessage = useCallback(
+    (event: MessageEvent) => {
+      let data: any;
+      try {
+        data = JSON.parse(event.data);
+      } catch {
+        return;
+      }
+      switch (data.type) {
+        case 'input_audio_buffer.speech_started':
+          setStatus('listening');
+          break;
+        case 'conversation.item.input_audio_transcription.completed':
+          handleUserTranscript(data.transcript || '');
+          break;
+        case 'response.output_audio_transcript.delta':
+          handleAssistantDelta(data.delta || '');
+          break;
+        case 'response.output_audio_transcript.done':
+          handleAssistantDone(data.transcript || '');
+          break;
+        case 'error':
+          onError?.(data.error?.message || 'Realtime error');
+          break;
+        default:
+          break;
+      }
+    },
+    [handleUserTranscript, handleAssistantDelta, handleAssistantDone, onError],
+  );
+
+  const stop = useCallback(() => {
+    try {
+      dcRef.current?.close();
+    } catch {
+      /* noop */
+    }
+    try {
+      pcRef.current?.close();
+    } catch {
+      /* noop */
+    }
+    streamRef.current?.getTracks().forEach((t) => t.stop());
+    if (audioElRef.current) {
+      audioElRef.current.srcObject = null;
+    }
+    dcRef.current = null;
+    pcRef.current = null;
+    streamRef.current = null;
+    setStatus('idle');
+    setUserCaption('');
+    setAssistantCaption('');
+    // Reconcile the thread with the database (authoritative) once we stop.
+    if (convoIdRef.current) {
+      queryClient.invalidateQueries([QueryKeys.messages, convoIdRef.current]);
+    }
+  }, [queryClient]);
+
+  const start = useCallback(async () => {
+    if (status !== 'idle') {
+      return;
+    }
+    setStatus('connecting');
+    try {
+      const session = (await request.post('/api/realtime/session')) as SessionResponse;
+      if (!session?.token || !session?.webrtcUrl) {
+        throw new Error('No realtime session token');
+      }
+
+      // Fix the persistence target + thread base for this session.
+      convoIdRef.current =
+        conversationId && conversationId !== Constants.NEW_CONVO ? conversationId : genId();
+      baseMessagesRef.current = (getMessages() || []).slice();
+      turnsRef.current = [];
+      lastIdRef.current = baseMessagesRef.current.length
+        ? baseMessagesRef.current[baseMessagesRef.current.length - 1].messageId
+        : Constants.NO_PARENT;
+
+      const pc = new RTCPeerConnection();
+      pcRef.current = pc;
+
+      if (!audioElRef.current) {
+        const el = document.createElement('audio');
+        el.autoplay = true;
+        audioElRef.current = el;
+      }
+      pc.ontrack = (e) => {
+        if (audioElRef.current && e.streams[0]) {
+          audioElRef.current.srcObject = e.streams[0];
+        }
+      };
+
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = stream;
+      stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+
+      const dc = pc.createDataChannel('realtime-channel');
+      dcRef.current = dc;
+      dc.onmessage = onDataChannelMessage;
+      dc.onopen = () => setStatus('listening');
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+
+      // webrtcfilter=on keeps the system prompt private; transcript events still flow.
+      const sdpResponse = await fetch(`${session.webrtcUrl}?webrtcfilter=on`, {
+        method: 'POST',
+        body: offer.sdp,
+        headers: {
+          Authorization: `Bearer ${session.token}`,
+          'Content-Type': 'application/sdp',
+        },
+      });
+      if (!sdpResponse.ok) {
+        throw new Error(`SDP exchange failed: ${sdpResponse.status}`);
+      }
+      const answer = { type: 'answer' as RTCSdpType, sdp: await sdpResponse.text() };
+      await pc.setRemoteDescription(answer);
+    } catch (err: any) {
+      onError?.(err?.message || 'Failed to start voice session');
+      stop();
+      setStatus('error');
+    }
+  }, [status, conversationId, getMessages, onDataChannelMessage, onError, stop]);
+
+  return { status, userCaption, assistantCaption, start, stop };
+}
