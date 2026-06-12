@@ -116,6 +116,7 @@ const MEMORY_TOOL = {
     + 'Do not save secrets, one-off requests, or sensitive medical data.',
   parameters: {
     type: 'object',
+    additionalProperties: false,
     properties: {
       key: {
         type: 'string',
@@ -178,21 +179,48 @@ let toolDispatch = {}; // name -> { url, path }
 let toolsLoaded = false;
 let toolsLoadAttempt = 0;
 
-function cleanSchema(node) {
+// Azure's realtime function-tool validator is STRICT: it 500s on `anyOf` and on
+// `additionalProperties: true` in a tool's parameter schema (verified live).
+// FastAPI/Pydantic emit exactly those for optional/open bodies (e.g. RM wraps
+// every tool body in `anyOf:[{additionalProperties:true,type:object},{null}]`),
+// so advertising any such tool made /session 502. This coerces a tool's
+// parameter schema into the clean object schema Azure accepts: collapse anyOf to
+// its first object branch, keep real `properties`, recurse into nested
+// properties/items, and force additionalProperties:false everywhere.
+function sanitizeToolSchema(node) {
   if (Array.isArray(node)) {
-    return node.map(cleanSchema);
+    return node.map(sanitizeToolSchema);
   }
-  if (node && typeof node === 'object') {
-    const out = {};
-    for (const [k, v] of Object.entries(node)) {
-      if (k === 'title') {
-        continue;
-      }
-      out[k] = cleanSchema(v);
+  if (!node || typeof node !== 'object') {
+    return node;
+  }
+  let n = { ...node };
+  // Collapse anyOf/oneOf/allOf: prefer the first object branch, else first non-null.
+  for (const key of ['anyOf', 'oneOf', 'allOf']) {
+    if (Array.isArray(n[key])) {
+      const branches = n[key];
+      const obj = branches.find((b) => b && b.type === 'object') ||
+        branches.find((b) => b && b.type && b.type !== 'null') ||
+        branches[0] || {};
+      delete n[key];
+      n = { ...obj, ...n }; // merge branch fields (e.g. properties) under n
     }
-    return out;
   }
-  return node;
+  if (n.type === 'object' || n.properties) {
+    n.type = 'object';
+    const props = {};
+    for (const [k, v] of Object.entries(n.properties || {})) {
+      props[k] = sanitizeToolSchema(v);
+    }
+    n.properties = props;
+    // Azure requires additionalProperties:false (true / object form -> 500).
+    n.additionalProperties = false;
+  }
+  if (n.items) {
+    n.items = sanitizeToolSchema(n.items);
+  }
+  delete n.title;
+  return n;
 }
 
 function coerceText(d) {
@@ -244,13 +272,15 @@ async function loadOneServer(url) {
     }
     let schema =
       ((((post.requestBody || {}).content || {})['application/json'] || {}).schema) || {};
-    let params = schema && Object.keys(schema).length ? cleanSchema(schema) : {};
+    // Azure realtime rejects anyOf / additionalProperties:true (-> 500 -> 502).
+    let params = schema && Object.keys(schema).length ? sanitizeToolSchema(schema) : {};
     if (!params || params.type !== 'object') {
-      params = { type: 'object', properties: {} };
+      params = { type: 'object', properties: {}, additionalProperties: false };
     }
     if (!params.properties) {
       params.properties = {};
     }
+    params.additionalProperties = false;
     const desc = (post.summary || post.description || tname).trim().slice(0, 300);
     defs.push({ type: 'function', name: tname, description: desc, parameters: params });
     dispatch[tname] = { url, path };
