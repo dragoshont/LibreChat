@@ -2,7 +2,7 @@ const express = require('express');
 const axios = require('axios');
 const { randomUUID } = require('crypto');
 const { logger } = require('@librechat/data-schemas');
-const { saveMessage, saveConvo } = require('~/models');
+const { saveMessage, saveConvo, getAllUserMemories, setMemory } = require('~/models');
 const { requireJwtAuth } = require('~/server/middleware');
 
 /**
@@ -84,6 +84,79 @@ const DENY_SUBSTR = [
 ];
 const TOOL_MAX = parseInt(process.env.REALTIME_TOOL_MAX || '28', 10);
 const TOOL_CALL_CHARS = parseInt(process.env.REALTIME_TOOL_CALL_CHARS || '3000', 10);
+
+// --- Per-user memory over voice (works with WebRTC via the tool relay) -------
+// Memory has two halves, both scoped to req.user.id so a user only ever sees
+// their own (reusing LibreChat's NATIVE memory store, so voice + text memory
+// are unified):
+//   RECALL  — at /session we load the user's memories and prepend them to the
+//             realtime instructions, so the assistant already "knows" them.
+//   SAVE    — a `memory_save` tool the model calls when the user shares a
+//             durable fact ("remember that ..."); relayed through /tool and
+//             written with setMemory(). Enabled by REALTIME_MEMORY=true.
+const MEMORY_ENABLED = (process.env.REALTIME_MEMORY || 'false').toLowerCase() === 'true';
+const MEMORY_MAX_CHARS = parseInt(process.env.REALTIME_MEMORY_MAX_CHARS || '2000', 10);
+
+const MEMORY_TOOL = {
+  type: 'function',
+  name: 'memory_save',
+  description:
+    'Save a durable personal fact about the user for future conversations '
+    + '(e.g. preferences, family details, recurring needs). Use ONLY when the '
+    + 'user shares something worth remembering long-term, or says "remember…". '
+    + 'Do not save secrets, one-off requests, or sensitive medical data.',
+  parameters: {
+    type: 'object',
+    properties: {
+      key: {
+        type: 'string',
+        description: 'Short topic slug for this memory, e.g. "preferred_doctor" or "kids".',
+      },
+      value: { type: 'string', description: 'The fact to remember, one or two sentences.' },
+    },
+    required: ['value'],
+  },
+};
+
+async function loadMemoryText(userId) {
+  if (!MEMORY_ENABLED) {
+    return '';
+  }
+  try {
+    const memories = await getAllUserMemories(userId);
+    if (!memories || !memories.length) {
+      return '';
+    }
+    const lines = memories
+      .sort((a, b) => new Date(b.updated_at || 0) - new Date(a.updated_at || 0))
+      .map((m) => `- ${m.key ? m.key + ': ' : ''}${m.value}`);
+    let text = lines.join('\n');
+    if (text.length > MEMORY_MAX_CHARS) {
+      text = text.slice(0, MEMORY_MAX_CHARS);
+    }
+    return text;
+  } catch (err) {
+    logger.warn(`[realtime] memory load failed: ${err.message}`);
+    return '';
+  }
+}
+
+async function saveMemory(userId, key, value) {
+  const v = (value || '').trim();
+  if (!v) {
+    return 'Nothing to remember.';
+  }
+  const k = (key || '').trim() || `note_${Date.now()}`;
+  try {
+    // setMemory upserts by (userId, key). Rough token estimate keeps the usage
+    // meter sane without pulling the tokenizer onto this path.
+    await setMemory({ userId, key: k, value: v, tokenCount: Math.ceil(v.length / 4) });
+    return `Saved to memory: ${v}`;
+  } catch (err) {
+    logger.warn(`[realtime] memory save failed: ${err.message}`);
+    return 'Could not save that to memory right now.';
+  }
+}
 
 let toolDefs = [];
 let toolDispatch = {}; // name -> { url, path }
@@ -214,7 +287,8 @@ router.get('/config', async (req, res) => {
     enabled: isEnabled(),
     deployment: AZURE_REALTIME_DEPLOYMENT,
     voice: REALTIME_VOICE,
-    toolCount: toolDefs.length,
+    toolCount: toolDefs.length + (MEMORY_ENABLED ? 1 : 0),
+    memory: MEMORY_ENABLED,
   });
 });
 
@@ -225,10 +299,20 @@ router.post('/session', async (req, res) => {
 
   await loadTools().catch(() => {});
 
+  // Per-user memory recall: prepend what we know about THIS user to the prompt.
+  let instructions = REALTIME_INSTRUCTIONS;
+  const memoryText = await loadMemoryText(req.user?.id);
+  if (memoryText) {
+    instructions +=
+      '\n\nWhat you already know about this user (from past conversations):\n'
+      + memoryText
+      + '\n\nUse this naturally; do not read it back verbatim.';
+  }
+
   const session = {
     type: 'realtime',
     model: AZURE_REALTIME_DEPLOYMENT,
-    instructions: REALTIME_INSTRUCTIONS,
+    instructions,
     audio: {
       input: {
         // REQUIRED for ChatGPT-style USER transcripts: without an input
@@ -246,8 +330,12 @@ router.post('/session', async (req, res) => {
     },
   };
 
-  if (toolDefs.length) {
-    session.tools = toolDefs;
+  const tools = toolDefs.slice();
+  if (MEMORY_ENABLED) {
+    tools.push(MEMORY_TOOL);
+  }
+  if (tools.length) {
+    session.tools = tools;
     session.tool_choice = 'auto';
   }
 
@@ -274,7 +362,7 @@ router.post('/session', async (req, res) => {
       // webrtcfilter=on; with tools we must receive the function-call events on
       // the data channel, so the filter is dropped (the prompt is not a secret
       // for this household app — the ephemeral token remains the boundary).
-      filterEvents: toolDefs.length === 0,
+      filterEvents: tools.length === 0,
     });
   } catch (err) {
     // Never leak the Azure key or upstream body verbatim to the client.
@@ -297,6 +385,25 @@ router.post('/tool', async (req, res) => {
   }
   await loadTools().catch(() => {});
   let { name, arguments: args } = req.body || {};
+  // Built-in memory tool (not an MCP server): write to the user's native store.
+  if (name === 'memory_save') {
+    if (!MEMORY_ENABLED) {
+      return res.status(400).json({ output: 'Memory is not enabled.' });
+    }
+    let a = args;
+    if (typeof a === 'string') {
+      try {
+        a = a.trim() ? JSON.parse(a) : {};
+      } catch {
+        a = {};
+      }
+    }
+    if (!a || typeof a !== 'object') {
+      a = {};
+    }
+    const output = await saveMemory(req.user?.id, a.key, a.value);
+    return res.json({ output });
+  }
   const target = toolDispatch[name];
   if (!target) {
     return res.status(400).json({ output: `Unknown tool: ${name}` });
