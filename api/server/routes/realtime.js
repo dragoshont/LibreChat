@@ -119,7 +119,7 @@ const MEMORY_TOOL = {
 };
 
 async function loadMemoryText(userId) {
-  if (!MEMORY_ENABLED) {
+  if (!MEMORY_ENABLED || !userId) {
     return '';
   }
   try {
@@ -142,6 +142,12 @@ async function loadMemoryText(userId) {
 }
 
 async function saveMemory(userId, key, value) {
+  // Hard per-user guard: never write memory without an authenticated user id
+  // (requireJwtAuth guarantees one upstream; this is defense-in-depth so a
+  // memory can never land in an unscoped/shared bucket).
+  if (!userId) {
+    return 'Could not save that (no authenticated user).';
+  }
   const v = (value || '').trim();
   if (!v) {
     return 'Nothing to remember.';
