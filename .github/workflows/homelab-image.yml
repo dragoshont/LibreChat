@@ -1,0 +1,90 @@
+---
+# Homelab image build for the LibreChat voice fork.
+#
+# Builds the custom LibreChat image (this fork's feat/realtime-voice) and pushes
+# it to GHCR so the homelab cluster pulls a reproducible, CI-built image instead
+# of a manual host `docker build`. Targets linux/amd64 (the MicroK8s node arch).
+#
+# Triggers (deliberately NOT tags or `dev`/`main` branches, so the inherited
+# upstream image workflows — tag-images.yml / dev-images.yml — never fire on
+# this fork):
+#   * push to feat/realtime-voice touching app/build files
+#   * manual workflow_dispatch (optionally with a clean image_tag like v0.8.0-rt9)
+#
+# Output tags on ghcr.io/<owner>/librechat-voice:
+#   * sha-<short>   immutable — pin THIS in the homelab deployment for rollouts
+#   * latest        moving branch head (convenience)
+#   * <image_tag>   only when provided via workflow_dispatch (e.g. v0.8.0-rt9)
+#
+# Enable once per fork: Actions tab -> "I understand my workflows, enable them".
+name: homelab-image
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Extra immutable tag to publish (e.g. v0.8.0-rt9)"
+        required: false
+        default: ""
+  push:
+    branches: [feat/realtime-voice]
+    paths:
+      - "api/**"
+      - "client/**"
+      - "packages/**"
+      - "Dockerfile"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/homelab-image.yml"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: homelab-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free up runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h / | tail -1
+
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/librechat-voice
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest,enable=${{ github.ref_name == 'feat/realtime-voice' }}
+            type=raw,value=${{ github.event.inputs.image_tag }},enable=${{ github.event.inputs.image_tag != '' }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
