@@ -446,7 +446,10 @@ router.post('/transcript', async (req, res) => {
     assistantMessageId,
     parentMessageId = null,
     endpoint,
+    endpointType,
     model,
+    agentId,
+    spec,
   } = req.body || {};
 
   if (!conversationId) {
@@ -455,7 +458,18 @@ router.post('/transcript', async (req, res) => {
 
   const userId = userMessageId || randomUUID();
   const assistantId = assistantMessageId || randomUUID();
-  const resolvedModel = model || AZURE_REALTIME_DEPLOYMENT;
+  // The conversation/message MODEL must stay the user's TEXT chat model so the
+  // chat is continuable by typing. The realtime deployment (gpt-realtime-1-5)
+  // is NOT a routable chat model — writing it here breaks the next typed turn.
+  // So attribution uses ONLY the client-provided chat model, never a realtime
+  // fallback (omit when absent, e.g. agents endpoint where model is null).
+  const convoFields = {
+    ...(endpoint ? { endpoint } : {}),
+    ...(endpointType ? { endpointType } : {}),
+    ...(model ? { model } : {}),
+    ...(agentId ? { agent_id: agentId } : {}),
+    ...(spec ? { spec } : {}),
+  };
 
   try {
     let savedUser = false;
@@ -487,7 +501,7 @@ router.post('/transcript', async (req, res) => {
           sender: 'Assistant',
           text: assistantText.trim(),
           isCreatedByUser: false,
-          model: resolvedModel,
+          ...(model ? { model } : {}),
           ...(endpoint ? { endpoint } : {}),
         },
         { context: 'realtime/transcript:assistant' },
@@ -497,13 +511,14 @@ router.post('/transcript', async (req, res) => {
 
     // Best-effort: ensure the conversation row exists / is bumped so the turn
     // shows in the sidebar. Failure here must not lose the saved messages.
+    // Only the user's real endpoint/model/agent are written (never the realtime
+    // deployment), so the conversation stays continuable by text.
     try {
       await saveConvo(
         req,
         {
           conversationId,
-          ...(endpoint ? { endpoint } : {}),
-          model: resolvedModel,
+          ...convoFields,
         },
         { context: 'realtime/transcript' },
       );

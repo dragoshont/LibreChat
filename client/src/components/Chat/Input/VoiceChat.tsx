@@ -143,7 +143,10 @@ export default function VoiceChat({ disabled }: { disabled?: boolean }) {
   const { status, userCaption, assistantCaption, start, stop } = useRealtimeVoice({
     conversationId: conversation?.conversationId,
     endpoint: conversation?.endpoint,
+    endpointType: conversation?.endpointType,
     model: conversation?.model,
+    agentId: (conversation as { agent_id?: string } | null)?.agent_id,
+    spec: conversation?.spec,
     getMessages,
     setMessages,
     onError: (message) => showToast({ message, status: 'error' }),

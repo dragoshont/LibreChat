@@ -37,7 +37,10 @@ type SessionResponse = {
 interface UseRealtimeVoiceParams {
   conversationId?: string | null;
   endpoint?: string | null;
+  endpointType?: string | null;
   model?: string | null;
+  agentId?: string | null;
+  spec?: string | null;
   getMessages: () => TMessage[] | undefined;
   setMessages: (messages: TMessage[]) => void;
   onError?: (message: string) => void;
@@ -48,7 +51,10 @@ const now = () => new Date().toISOString();
 export default function useRealtimeVoice({
   conversationId,
   endpoint,
+  endpointType,
   model,
+  agentId,
+  spec,
   getMessages,
   setMessages,
   onError,
@@ -145,13 +151,16 @@ export default function useRealtimeVoice({
           assistantMessageId: assistantIdRef.current ?? undefined,
           parentMessageId: userParentRef.current,
           endpoint: endpoint ?? undefined,
+          endpointType: endpointType ?? undefined,
           model: model ?? undefined,
+          agentId: agentId ?? undefined,
+          spec: spec ?? undefined,
         });
       } catch {
         /* best-effort; the DB reconcile on stop covers transient failures */
       }
     },
-    [endpoint, model],
+    [endpoint, endpointType, model, agentId, spec],
   );
 
   const handleUserTranscript = useCallback(
