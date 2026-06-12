@@ -21,7 +21,8 @@ const {
   isAssistantsEndpoint,
 } = require('librechat-data-provider');
 const { getMCPManager, getFlowStateManager, getOAuthReconnectionManager } = require('~/config');
-const { findToken, createToken, updateToken } = require('~/models');
+const { findToken, createToken, updateToken, getUserById } = require('~/models');
+const { isServerAllowedForUser } = require('~/server/utils/mcpUserGate');
 const { reinitMCPServer } = require('./Tools/mcp');
 const { getAppConfig } = require('./Config');
 const { getLogStores } = require('~/cache');
@@ -321,6 +322,27 @@ function createToolInstance({ res, toolName, serverName, toolDefinition, provide
   /** @type {(toolArguments: Object | string, config?: GraphRunnableConfig) => Promise<unknown>} */
   const _call = async (toolArguments, config) => {
     const userId = config?.configurable?.user?.id || config?.configurable?.user_id;
+    // Per-user MCP gate (privacy): a gated server's tools may only be called by
+    // its allow-listed user(s) (MCP_USER_GATE). Ungated servers are unaffected.
+    // This is the hard boundary — even if a gated tool leaks into someone's
+    // tool list, the call itself is refused here.
+    {
+      const cfgUser = config?.configurable?.user;
+      let gateEmail = cfgUser && typeof cfgUser === 'object' ? cfgUser.email : null;
+      if (!gateEmail && userId) {
+        try {
+          const gateDoc = await getUserById(userId, 'email');
+          gateEmail = gateDoc?.email ?? null;
+        } catch (gateErr) {
+          logger.warn(`[MCP][gate] could not resolve email for user ${userId}: ${gateErr.message}`);
+        }
+      }
+      if (!isServerAllowedForUser(serverName, gateEmail)) {
+        throw new Error(
+          `Access denied: you do not have permission to use the "${serverName}" MCP server.`,
+        );
+      }
+    }
     /** @type {ReturnType<typeof createAbortHandler>} */
     let abortHandler = null;
     /** @type {AbortSignal} */

@@ -3,15 +3,22 @@ const { CacheKeys } = require('librechat-data-provider');
 const { getToolkitKey, checkPluginAuth, filterUniquePlugins } = require('@librechat/api');
 const { getCachedTools, setCachedTools } = require('~/server/services/Config');
 const { availableTools, toolkits } = require('~/app/clients/tools');
+const { isToolAllowedForUser } = require('~/server/utils/mcpUserGate');
 const { getAppConfig } = require('~/server/services/Config');
 const { getLogStores } = require('~/cache');
 
 const getAvailablePluginsController = async (req, res) => {
   try {
+    // Per-user MCP gate: hide gated MCP tools from users not on their allow-list
+    // (applied on the way OUT so the shared cache stays user-agnostic).
+    const gateForUser = (list) =>
+      Array.isArray(list)
+        ? list.filter((p) => isToolAllowedForUser(p?.pluginKey, req.user?.email))
+        : list;
     const cache = getLogStores(CacheKeys.CONFIG_STORE);
     const cachedPlugins = await cache.get(CacheKeys.PLUGINS);
     if (cachedPlugins) {
-      res.status(200).json(cachedPlugins);
+      res.status(200).json(gateForUser(cachedPlugins));
       return;
     }
 
@@ -38,7 +45,7 @@ const getAvailablePluginsController = async (req, res) => {
     }
 
     await cache.set(CacheKeys.PLUGINS, plugins);
-    res.status(200).json(plugins);
+    res.status(200).json(gateForUser(plugins));
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -63,6 +70,12 @@ const getAvailableTools = async (req, res) => {
       logger.warn('[getAvailableTools] User ID not found in request');
       return res.status(401).json({ message: 'Unauthorized' });
     }
+    // Per-user MCP gate: filter gated MCP tools out of THIS user's list on the
+    // way out (the shared CacheKeys.TOOLS stays the full, user-agnostic set).
+    const gateForUser = (list) =>
+      Array.isArray(list)
+        ? list.filter((p) => isToolAllowedForUser(p?.pluginKey, req.user?.email))
+        : list;
     const cache = getLogStores(CacheKeys.CONFIG_STORE);
     const cachedToolsArray = await cache.get(CacheKeys.TOOLS);
 
@@ -70,7 +83,7 @@ const getAvailableTools = async (req, res) => {
 
     // Return early if we have cached tools
     if (cachedToolsArray != null) {
-      res.status(200).json(cachedToolsArray);
+      res.status(200).json(gateForUser(cachedToolsArray));
       return;
     }
 
@@ -116,7 +129,7 @@ const getAvailableTools = async (req, res) => {
     const finalTools = filterUniquePlugins(toolsOutput);
     await cache.set(CacheKeys.TOOLS, finalTools);
 
-    res.status(200).json(finalTools);
+    res.status(200).json(gateForUser(finalTools));
   } catch (error) {
     logger.error('[getAvailableTools]', error);
     res.status(500).json({ message: error.message });
