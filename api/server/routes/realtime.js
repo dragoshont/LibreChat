@@ -454,6 +454,11 @@ router.post('/transcript', async (req, res) => {
     userMessageId,
     assistantMessageId,
     parentMessageId = null,
+    // Explicit per-message parents (preferred): the client owns the chain and
+    // sends a strictly LINEAR parent for each message. Falling back to the
+    // legacy single parentMessageId keeps older clients working.
+    userParentMessageId,
+    assistantParentMessageId,
     endpoint,
     endpointType,
     model,
@@ -500,7 +505,7 @@ router.post('/transcript', async (req, res) => {
         {
           conversationId,
           messageId: userId,
-          parentMessageId: parentMessageId || null,
+          parentMessageId: userParentMessageId ?? parentMessageId ?? null,
           sender: 'User',
           text: userText.trim(),
           isCreatedByUser: true,
@@ -513,12 +518,16 @@ router.post('/transcript', async (req, res) => {
 
     let savedAssistant = false;
     if (typeof assistantText === 'string' && assistantText.trim()) {
+      // Linear chain: prefer the explicit assistant parent; else chain to the
+      // user turn just saved; else the legacy parent. Never cross-link.
+      const aParent =
+        assistantParentMessageId ?? (savedUser ? userId : parentMessageId ?? null);
       await saveMessage(
         req,
         {
           conversationId,
           messageId: assistantId,
-          parentMessageId: savedUser ? userId : parentMessageId || null,
+          parentMessageId: aParent,
           sender: 'Assistant',
           text: assistantText.trim(),
           isCreatedByUser: false,

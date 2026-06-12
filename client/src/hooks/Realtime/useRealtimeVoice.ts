@@ -80,6 +80,11 @@ export default function useRealtimeVoice({
   const turnsRef = useRef<TMessage[]>([]);
   // Parent-id chain so the thread tree is well-formed.
   const lastIdRef = useRef<string>(Constants.NO_PARENT);
+  // The PERSISTED chain head — the id the next persisted message links to.
+  // Advanced ONLY at persist time so the saved thread is a strict linear chain
+  // (event-time parents race under server-VAD + the assistant-greets-first flow
+  // and could otherwise cross-link into a cycle that breaks the conversation).
+  const chainHeadRef = useRef<string>(Constants.NO_PARENT);
 
   // Current in-flight turn bookkeeping.
   const userTextRef = useRef('');
@@ -142,14 +147,35 @@ export default function useRealtimeVoice({
       if (!convoIdRef.current) {
         return;
       }
+      const hasUser = !!(userTextRef.current && userTextRef.current.trim());
+      const hasAssistant = !!(assistantFinalText && assistantFinalText.trim());
+      if (!hasUser && !hasAssistant) {
+        return;
+      }
+      const uId = userIdRef.current ?? undefined;
+      const aId = assistantIdRef.current ?? undefined;
+      // Strict linear chain decided HERE: user links to the current head, the
+      // assistant links to the user (or the head if there was no user turn,
+      // e.g. the assistant's opening greeting). Then advance the head. A new
+      // genId can only ever point at an OLDER id, so a cycle is impossible.
+      const head = chainHeadRef.current;
+      const userParentMessageId = head;
+      const assistantParentMessageId = hasUser && uId ? uId : head;
+      if (hasAssistant && aId) {
+        chainHeadRef.current = aId;
+      } else if (hasUser && uId) {
+        chainHeadRef.current = uId;
+      }
       try {
         await request.post('/api/realtime/transcript', {
           conversationId: convoIdRef.current,
           userText: userTextRef.current,
           assistantText: assistantFinalText,
-          userMessageId: userIdRef.current ?? undefined,
-          assistantMessageId: assistantIdRef.current ?? undefined,
-          parentMessageId: userParentRef.current,
+          userMessageId: uId,
+          assistantMessageId: aId,
+          userParentMessageId,
+          assistantParentMessageId,
+          parentMessageId: userParentMessageId,
           endpoint: endpoint ?? undefined,
           endpointType: endpointType ?? undefined,
           model: model ?? undefined,
@@ -387,6 +413,9 @@ export default function useRealtimeVoice({
       lastIdRef.current = baseMessagesRef.current.length
         ? baseMessagesRef.current[baseMessagesRef.current.length - 1].messageId
         : Constants.NO_PARENT;
+      // The persisted chain starts from the last existing message (so voice
+      // turns append after prior history) or the root for a fresh chat.
+      chainHeadRef.current = lastIdRef.current;
 
       const pc = new RTCPeerConnection();
       pcRef.current = pc;
