@@ -29,6 +29,9 @@ type SessionResponse = {
   deployment: string;
   webrtcUrl: string;
   expiresAt: number | null;
+  // false when tools are advertised (we then need the function-call events on
+  // the data channel, so webrtcfilter must be OFF). true/undefined => filter on.
+  filterEvents?: boolean;
 };
 
 interface UseRealtimeVoiceParams {
@@ -78,6 +81,12 @@ export default function useRealtimeVoice({
   const userParentRef = useRef<string>(Constants.NO_PARENT);
   const assistantTextRef = useRef('');
   const assistantIdRef = useRef<string | null>(null);
+
+  // Tool-call relay bookkeeping (dedupe by call_id; trigger one response.create
+  // once every in-flight tool call for the turn has been answered).
+  const toolHandledRef = useRef<Set<string>>(new Set());
+  const toolNamesRef = useRef<Record<string, string>>({});
+  const pendingToolRef = useRef(0);
 
   const genId = () =>
     typeof crypto !== 'undefined' && crypto.randomUUID
@@ -227,6 +236,49 @@ export default function useRealtimeVoice({
     [makeMessage, upsertTurn, persistTurn],
   );
 
+  // Relay a realtime function call to the in-cluster MCP bridge
+  // (POST /api/realtime/tool, authed), then return the result over the data
+  // channel and ask the model to continue once all in-flight calls are done.
+  const maybeRunTool = useCallback(async (callId?: string, name?: string, rawArgs?: any) => {
+    if (!callId || !name || toolHandledRef.current.has(callId)) {
+      return;
+    }
+    toolHandledRef.current.add(callId);
+    pendingToolRef.current += 1;
+    let args: any = {};
+    if (rawArgs && typeof rawArgs === 'object') {
+      args = rawArgs;
+    } else if (typeof rawArgs === 'string') {
+      try {
+        args = rawArgs ? JSON.parse(rawArgs) : {};
+      } catch {
+        args = {};
+      }
+    }
+    let output = '';
+    try {
+      const res = (await request.post('/api/realtime/tool', { name, arguments: args })) as {
+        output?: string;
+      };
+      output = res?.output || '';
+    } catch {
+      output = 'That tool is unavailable right now.';
+    }
+    const dc = dcRef.current;
+    if (dc && dc.readyState === 'open') {
+      dc.send(
+        JSON.stringify({
+          type: 'conversation.item.create',
+          item: { type: 'function_call_output', call_id: callId, output },
+        }),
+      );
+    }
+    pendingToolRef.current -= 1;
+    if (pendingToolRef.current <= 0 && dc && dc.readyState === 'open') {
+      dc.send(JSON.stringify({ type: 'response.create' }));
+    }
+  }, []);
+
   const onDataChannelMessage = useCallback(
     (event: MessageEvent) => {
       let data: any;
@@ -248,6 +300,25 @@ export default function useRealtimeVoice({
         case 'response.output_audio_transcript.done':
           handleAssistantDone(data.transcript || '');
           break;
+        case 'response.output_item.added':
+        case 'response.output_item.done':
+          if (data.item && data.item.type === 'function_call') {
+            if (data.item.call_id && data.item.name) {
+              toolNamesRef.current[data.item.call_id] = data.item.name;
+            }
+            // .done carries the fully assembled arguments string.
+            if (data.type === 'response.output_item.done') {
+              void maybeRunTool(data.item.call_id, data.item.name, data.item.arguments);
+            }
+          }
+          break;
+        case 'response.function_call_arguments.done':
+          void maybeRunTool(
+            data.call_id,
+            data.name || toolNamesRef.current[data.call_id],
+            data.arguments,
+          );
+          break;
         case 'error':
           onError?.(data.error?.message || 'Realtime error');
           break;
@@ -255,7 +326,7 @@ export default function useRealtimeVoice({
           break;
       }
     },
-    [handleUserTranscript, handleAssistantDelta, handleAssistantDone, onError],
+    [handleUserTranscript, handleAssistantDelta, handleAssistantDone, maybeRunTool, onError],
   );
 
   const stop = useCallback(() => {
@@ -301,6 +372,9 @@ export default function useRealtimeVoice({
         conversationId && conversationId !== Constants.NEW_CONVO ? conversationId : genId();
       baseMessagesRef.current = (getMessages() || []).slice();
       turnsRef.current = [];
+      toolHandledRef.current.clear();
+      toolNamesRef.current = {};
+      pendingToolRef.current = 0;
       lastIdRef.current = baseMessagesRef.current.length
         ? baseMessagesRef.current[baseMessagesRef.current.length - 1].messageId
         : Constants.NO_PARENT;
@@ -331,8 +405,14 @@ export default function useRealtimeVoice({
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
 
-      // webrtcfilter=on keeps the system prompt private; transcript events still flow.
-      const sdpResponse = await fetch(`${session.webrtcUrl}?webrtcfilter=on`, {
+      // webrtcfilter=on keeps the system prompt private but DROPS the
+      // function-call events; when tools are advertised the server returns
+      // filterEvents:false so we receive them. Default (undefined) => no filter.
+      const callsUrl =
+        session.filterEvents === true
+          ? `${session.webrtcUrl}?webrtcfilter=on`
+          : session.webrtcUrl;
+      const sdpResponse = await fetch(callsUrl, {
         method: 'POST',
         body: offer.sdp,
         headers: {
