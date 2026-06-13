@@ -49,6 +49,26 @@ const { getRoleByName } = require('~/models/Role');
 const { loadAgent } = require('~/models/Agent');
 const { getMCPManager } = require('~/config');
 
+/**
+ * The signed-in user's OpenID (Microsoft Entra) access token, when it is safe to
+ * forward to identity-aware MCP servers (e.g. Tessera). With OPENID_REUSE_TOKENS
+ * the user's bearer to LibreChat IS their provider access token (aud = the chat
+ * app), so it is forwarded verbatim as the per-user subject token. Returns
+ * undefined for non-OpenID sessions or when token reuse is off — a LibreChat
+ * internal JWT must never be forwarded to an upstream resource server.
+ * @param {import('express').Request} [req]
+ * @returns {string|undefined}
+ */
+function getForwardableOpenIdToken(req) {
+  const reuse = String(process.env.OPENID_REUSE_TOKENS || '').toLowerCase();
+  if (req?.user?.provider !== 'openid' || (reuse !== 'true' && reuse !== '1')) {
+    return undefined;
+  }
+  const auth = req?.headers?.authorization || '';
+  const match = /^Bearer\s+(.+)$/i.exec(auth);
+  return match ? match[1].trim() : undefined;
+}
+
 const omitTitleOptions = new Set([
   'stream',
   'thinking',
@@ -790,6 +810,12 @@ class AgentClient extends BaseClient {
             parentMessageId: this.parentMessageId,
           },
           user: this.options.req.user,
+          /**
+           * Per-user delegation: forward the signed-in user's OpenID (Entra)
+           * access token to identity-aware MCP servers (e.g. Tessera) as the
+           * subject token. Undefined for non-OpenID sessions (never forwarded).
+           */
+          openidAccessToken: getForwardableOpenIdToken(this.options.req),
         },
         recursionLimit: agentsEConfig?.recursionLimit ?? 25,
         signal: abortController.signal,

@@ -35,6 +35,7 @@ const { recordUsage } = require('~/server/services/Threads');
 const { loadTools } = require('~/app/clients/tools/util');
 const { redactMessage } = require('~/config/parsers');
 const { findPluginAuthsByKeys } = require('~/models');
+const { isToolAllowedForUser } = require('~/server/utils/mcpUserGate');
 /**
  * Processes the required actions by calling the appropriate tools and returning the outputs.
  * @param {OpenAIClient} client - OpenAI or StreamRunManager Client.
@@ -455,7 +456,13 @@ async function loadAgentTools({ req, res, agent, signal, tool_resources, openAIA
     }
 
     if (tool.mcp === true) {
-      agentTools.push(tool);
+      // Per-user MCP gate (privacy): only expose a gated server's tools to its
+      // allow-listed user(s) (MCP_USER_GATE). Ungated servers are unaffected. The
+      // hard deny still lives in MCP.js _call; this stops gated tools from leaking
+      // into another user's tool list (e.g. one person's medical-portal server).
+      if (isToolAllowedForUser(tool.name, req.user?.email)) {
+        agentTools.push(tool);
+      }
       continue;
     }
 

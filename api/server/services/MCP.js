@@ -378,8 +378,16 @@ function createToolInstance({ res, toolName, serverName, toolDefinition, provide
         derivedSignal.addEventListener('abort', abortHandler, { once: true });
       }
 
-      const customUserVars =
+      const baseUserVars =
         config?.configurable?.userMCPAuthMap?.[`${Constants.mcp_prefix}${serverName}`];
+      // Identity-aware MCP servers (e.g. Tessera) receive the signed-in user's
+      // OpenID (Entra) access token as {{LIBRECHAT_OPENID_ACCESS_TOKEN}} so they
+      // can act per-user. Only a server whose header references the placeholder
+      // actually gets it (processMCPEnv substitutes referenced placeholders only).
+      const openidAccessToken = config?.configurable?.openidAccessToken;
+      const customUserVars = openidAccessToken
+        ? { ...(baseUserVars || {}), LIBRECHAT_OPENID_ACCESS_TOKEN: openidAccessToken }
+        : baseUserVars;
 
       const result = await mcpManager.callTool({
         serverName,
