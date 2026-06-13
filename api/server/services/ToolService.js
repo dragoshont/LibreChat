@@ -34,7 +34,7 @@ const { createOnSearchResults } = require('~/server/services/Tools/search');
 const { recordUsage } = require('~/server/services/Threads');
 const { loadTools } = require('~/app/clients/tools/util');
 const { redactMessage } = require('~/config/parsers');
-const { findPluginAuthsByKeys } = require('~/models');
+const { findPluginAuthsByKeys, getUserById } = require('~/models');
 const { isToolAllowedForUser } = require('~/server/utils/mcpUserGate');
 /**
  * Processes the required actions by calling the appropriate tools and returning the outputs.
@@ -444,6 +444,19 @@ async function loadAgentTools({ req, res, agent, signal, tool_resources, openAIA
   });
 
   const agentTools = [];
+  // Resolve the user's email ONCE for the per-user MCP gate. In the agents flow
+  // req.user is often just { id } (no email), so fall back to a lookup — mirrors
+  // the call-time gate in MCP.js. Without this, gated servers (email required)
+  // would be hidden from EVERYONE, i.e. "no available server".
+  let gateEmail = req.user?.email ?? null;
+  if (!gateEmail && req.user?.id) {
+    try {
+      const gateDoc = await getUserById(req.user.id, 'email');
+      gateEmail = gateDoc?.email ?? null;
+    } catch (gateErr) {
+      logger.warn(`[tools][gate] could not resolve email for user ${req.user.id}: ${gateErr.message}`);
+    }
+  }
   for (let i = 0; i < loadedTools.length; i++) {
     const tool = loadedTools[i];
     if (tool.name && (tool.name === Tools.execute_code || tool.name === Tools.file_search)) {
@@ -460,7 +473,7 @@ async function loadAgentTools({ req, res, agent, signal, tool_resources, openAIA
       // allow-listed user(s) (MCP_USER_GATE). Ungated servers are unaffected. The
       // hard deny still lives in MCP.js _call; this stops gated tools from leaking
       // into another user's tool list (e.g. one person's medical-portal server).
-      if (isToolAllowedForUser(tool.name, req.user?.email)) {
+      if (isToolAllowedForUser(tool.name, gateEmail)) {
         agentTools.push(tool);
       }
       continue;
