@@ -439,7 +439,14 @@ router.post('/session', async (req, res) => {
     },
   };
 
-  const tools = toolDefs.slice();
+  // Deterministic tool order so the instructions+tools prefix stays byte-stable
+  // across sessions — that prefix is the only part Azure realtime prompt caching
+  // can reuse (the accumulating audio context is never cacheable). MCP discovery
+  // order must not perturb it, so sort by name. Memory + web-search tools are
+  // appended in a fixed order after.
+  const tools = toolDefs
+    .slice()
+    .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
   if (MEMORY_ENABLED) {
     tools.push(MEMORY_TOOL);
   }
