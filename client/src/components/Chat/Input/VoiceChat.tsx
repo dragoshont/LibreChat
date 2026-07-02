@@ -29,9 +29,14 @@ function VoiceWaveIcon({ className }: { className?: string }) {
       strokeLinejoin="round"
       aria-hidden="true"
     >
-      <path d="M12 2a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z" />
-      <path d="M19 10v1a7 7 0 0 1-14 0v-1" />
-      <line x1="12" y1="19" x2="12" y2="22" />
+      {/* Apple `waveform` idiom — live audio, deliberately NOT a microphone (the
+          mic glyph belongs to dictation / AudioRecorder). Symmetric bars, tallest
+          in the center, so it never reads as a second dictation button. */}
+      <line x1="4" y1="9" x2="4" y2="15" />
+      <line x1="8" y1="6" x2="8" y2="18" />
+      <line x1="12" y1="3" x2="12" y2="21" />
+      <line x1="16" y1="6" x2="16" y2="18" />
+      <line x1="20" y1="9" x2="20" y2="15" />
     </svg>
   );
 }
@@ -185,7 +190,9 @@ export default function VoiceChat({ disabled }: { disabled?: boolean }) {
             )}
             title="Voice chat"
           >
-            <VoiceWaveIcon className="text-text-secondary" />
+            {/* Accent color distinguishes the live-voice affordance from the
+                neutral dictation mic sitting next to it. */}
+            <VoiceWaveIcon className="text-blue-500" />
           </button>
         }
       />

@@ -323,7 +323,12 @@ const ChatForm = memo(({ index = 0 }: { index?: number }) => {
                   isSubmitting={isSubmitting}
                 />
               )}
-              <VoiceChat disabled={disableInputs || isNotAppendable} />
+              {/* Extra separation so the live-voice waveform reads as distinct
+                  from the dictation mic beside it (RTL-safe, matches the sibling
+                  margin pattern). */}
+              <div className={isRTL ? 'mr-1' : 'ml-1'}>
+                <VoiceChat disabled={disableInputs || isNotAppendable} />
+              </div>
               <div className={`${isRTL ? 'ml-2' : 'mr-2'}`}>
                 {(isSubmitting || isSubmittingAdded) && (showStopButton || showStopAdded) ? (
                   <StopButton stop={handleStopGenerating} setShowStopButton={setShowStopButton} />
