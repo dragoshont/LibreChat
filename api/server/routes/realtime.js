@@ -2,7 +2,7 @@ const express = require('express');
 const axios = require('axios');
 const { randomUUID } = require('crypto');
 const { logger } = require('@librechat/data-schemas');
-const { saveMessage, saveConvo, getAllUserMemories, setMemory } = require('~/models');
+const { saveMessage, saveConvo, getMessages, getAllUserMemories, setMemory } = require('~/models');
 const { requireJwtAuth } = require('~/server/middleware');
 
 /**
@@ -147,6 +147,38 @@ async function loadMemoryText(userId) {
     return text;
   } catch (err) {
     logger.warn(`[realtime] memory load failed: ${err.message}`);
+    return '';
+  }
+}
+
+// Continue the OPEN text conversation over voice: load its recent turns so the
+// voice model shares the SAME context as the chat thread (env-tunable budget so
+// a long thread can't blow the realtime prompt). User-scoped: getMessages filters
+// by user id, so a session can only ever load the caller's own conversation.
+const HISTORY_MAX_MESSAGES = parseInt(process.env.REALTIME_HISTORY_MAX_MESSAGES || '40', 10);
+const HISTORY_MAX_CHARS = parseInt(process.env.REALTIME_HISTORY_MAX_CHARS || '8000', 10);
+
+async function loadConversationText(userId, conversationId) {
+  if (!userId || !conversationId) {
+    return '';
+  }
+  try {
+    const messages = await getMessages({ conversationId, user: userId });
+    if (!messages || !messages.length) {
+      return '';
+    }
+    const turns = messages
+      .filter((m) => m && typeof m.text === 'string' && m.text.trim())
+      .sort((a, b) => new Date(a.createdAt || 0) - new Date(b.createdAt || 0))
+      .slice(-HISTORY_MAX_MESSAGES)
+      .map((m) => `${m.isCreatedByUser ? 'User' : 'Assistant'}: ${m.text.trim()}`);
+    let text = turns.join('\n');
+    if (text.length > HISTORY_MAX_CHARS) {
+      text = text.slice(-HISTORY_MAX_CHARS); // keep the MOST RECENT context
+    }
+    return text;
+  } catch (err) {
+    logger.warn(`[realtime] conversation history load failed: ${err.message}`);
     return '';
   }
 }
@@ -416,6 +448,15 @@ router.post('/session', async (req, res) => {
       '\n\nWhat you already know about this user (from past conversations):\n'
       + memoryText
       + '\n\nUse this naturally; do not read it back verbatim.';
+  }
+
+  // Continue the SAME chat over voice: prepend the open thread's history so the
+  // voice model picks up with full context instead of starting blank.
+  const historyText = await loadConversationText(req.user?.id, req.body?.conversationId);
+  if (historyText) {
+    instructions +=
+      '\n\nThe ongoing conversation in THIS chat so far (continue it seamlessly, keep full context, do not repeat it back):\n'
+      + historyText;
   }
 
   const session = {

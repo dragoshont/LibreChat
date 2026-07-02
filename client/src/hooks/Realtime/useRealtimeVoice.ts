@@ -397,7 +397,12 @@ export default function useRealtimeVoice({
     }
     setStatus('connecting');
     try {
-      const session = (await request.post('/api/realtime/session')) as SessionResponse;
+      const session = (await request.post('/api/realtime/session', {
+        // Continue the OPEN conversation: tell the server which thread to load as
+        // context (omit for a brand-new chat so it starts fresh).
+        conversationId:
+          conversationId && conversationId !== Constants.NEW_CONVO ? conversationId : undefined,
+      })) as SessionResponse;
       if (!session?.token || !session?.webrtcUrl) {
         throw new Error('No realtime session token');
       }
