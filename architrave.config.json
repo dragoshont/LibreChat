@@ -1,0 +1,26 @@
+{
+  "platform": "web",
+  "stack": "react",
+  "knowledgePack": "web",
+  "_designSource": "LibreChat has NO Storybook for our fork components. UI grounding = reproduce the existing components under client/src/components + packages/client and LibreChat's semantic Tailwind tokens (text-text-*, surface-*, border-*), plus the web knowledge pack. New/changed UI is previewed by running the client (npm run frontend:dev) or a Playwright screenshot of the running app — there is no Storybook preview step.",
+  "applyTo": ["client/src/**"],
+  "build": "npm run frontend && npm --prefix client run typecheck",
+  "test": "npm run test:client",
+  "backend": {
+    "stack": "node",
+    "architectureDocs": ["README.md", "AGENTS.md"],
+    "applyTo": ["api/**", "packages/**"],
+    "test": "npm run test:api"
+  },
+  "learning": {
+    "runArtifactsPath": ".architrave/runs",
+    "repoProfilePath": ".architrave/learning/repo-profile.md",
+    "lessonsPath": ".architrave/learning/repo-lessons.md",
+    "capture": ["run-artifacts", "gate-results", "judge-verdicts", "runtime-evidence", "repo-profile", "lessons"],
+    "redactionPolicy": "no-secrets",
+    "staleFactPolicy": "validate-before-use",
+    "promotionPolicy": "approval-required",
+    "promoteAfterOccurrences": 2,
+    "promoteTargets": ["architrave.config.json", "AGENTS.md", ".github/instructions", "docs"]
+  }
+}
