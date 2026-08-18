@@ -32,6 +32,7 @@ jest.mock('~/server/middleware', () => ({
     req.user = {
       id: req.get('x-test-user-id') || 'owner-id',
       email: req.get('x-test-user-email') || undefined,
+      provider: req.get('x-test-provider') || 'openid',
     };
     next();
   },
@@ -78,8 +79,8 @@ describe('realtime MCP authorization', () => {
     process.env.REALTIME_TOOL_ALLOW =
       'rm_list_appointments,rm_create_appointment,rm_cancel_appointment';
     process.env.REALTIME_MUTATING_ALLOW = 'rm_create_appointment,rm_cancel_appointment';
-    process.env.REALTIME_MCP_ACTION_TOKEN_ENVS = 'reginamaria=RM_TEST_ACTION_TOKEN';
-    process.env.RM_TEST_ACTION_TOKEN = 'synthetic-action-token';
+    process.env.REALTIME_MCP_USER_AUTH_SERVERS = 'reginamaria';
+    process.env.OPENID_REUSE_TOKENS = 'true';
     process.env.MCP_USER_GATE = 'reginamaria=owner@example.com;secondary=owner@example.com';
 
     serverSpecs.set('http://reginamaria.test/openapi.json', openapi);
@@ -107,13 +108,14 @@ describe('realtime MCP authorization', () => {
   });
 
   afterAll(() => {
-    delete process.env.RM_TEST_ACTION_TOKEN;
+    delete process.env.REALTIME_MCP_USER_AUTH_SERVERS;
     delete process.env.MCP_USER_GATE;
   });
 
   test('advertises gated tools only to the owner', async () => {
     const owner = await request(app)
       .get('/api/realtime/config')
+      .set('Authorization', 'Bearer user-token')
       .set('x-test-user-email', 'owner@example.com');
     const other = await request(app)
       .get('/api/realtime/config')
@@ -128,6 +130,7 @@ describe('realtime MCP authorization', () => {
   test('resolves an owner email from the authenticated user id', async () => {
     const response = await request(app)
       .get('/api/realtime/config')
+      .set('Authorization', 'Bearer user-token')
       .set('x-test-user-id', 'owner-id');
 
     expect(response.body.toolCount).toBe(3);
@@ -137,21 +140,23 @@ describe('realtime MCP authorization', () => {
   test.each([
     ['rm_create_appointment', { interval_id: 'interval', physician_id: 'physician' }],
     ['rm_cancel_appointment', { appointment_id: 'appointment' }],
-  ])('injects authority after owner mediation for %s', async (name, args) => {
+  ])('forwards delegated user identity after owner mediation for %s', async (name, args) => {
     axios.post.mockResolvedValue({ data: { accepted: true } });
 
     const response = await request(app)
       .post('/api/realtime/tool')
+      .set('Authorization', 'Bearer user-token')
       .set('x-test-user-email', 'owner@example.com')
-      .send({ name, arguments: args });
+      .send({ name, arguments: args, callId: 'realtime-call-1' });
 
     expect(response.status).toBe(200);
     expect(axios.post).toHaveBeenCalledWith(`http://reginamaria.test/${name}`, args, {
       headers: {
         'Content-Type': 'application/json',
-        'X-Tessera-Action-Token': 'synthetic-action-token',
+        Authorization: 'Bearer user-token',
+        'X-Tessera-Invocation-Id': 'realtime-call-1',
       },
-      timeout: 20000,
+      timeout: 70000,
     });
     expect(JSON.stringify(axios.post.mock.calls)).not.toContain('_tessera_action_token');
   });
@@ -161,6 +166,7 @@ describe('realtime MCP authorization', () => {
 
     const response = await request(app)
       .post('/api/realtime/tool')
+      .set('Authorization', 'Bearer user-token')
       .set('x-test-user-email', 'owner@example.com')
       .send({ name: 'rm_list_appointments', arguments: {} });
 
@@ -170,19 +176,54 @@ describe('realtime MCP authorization', () => {
     });
   });
 
-  test('does not log mutation authority when connector dispatch fails', async () => {
-    axios.post.mockRejectedValue(new Error('synthetic connector failure'));
+  test.each([undefined, '', 'bad id', 'x'.repeat(129)])(
+    'rejects an invalid mutation call ID before dispatch: %s',
+    async (callId) => {
+      const response = await request(app)
+        .post('/api/realtime/tool')
+        .set('Authorization', 'Bearer user-token')
+        .set('x-test-user-email', 'owner@example.com')
+        .send({
+          name: 'rm_cancel_appointment',
+          arguments: { appointment_id: 'appointment' },
+          ...(callId === undefined ? {} : { callId }),
+        });
 
+      expect(response.status).toBe(503);
+      expect(axios.post).not.toHaveBeenCalled();
+    },
+  );
+
+  test('rejects an ambiguous delegated authorization value before dispatch', async () => {
     const response = await request(app)
       .post('/api/realtime/tool')
+      .set('Authorization', 'Bearer user-one, Bearer user-two')
       .set('x-test-user-email', 'owner@example.com')
       .send({
         name: 'rm_cancel_appointment',
         arguments: { appointment_id: 'appointment' },
+        callId: 'realtime-call-ambiguous',
+      });
+
+    expect(response.status).toBe(503);
+    expect(axios.post).not.toHaveBeenCalled();
+  });
+
+  test('does not log delegated user token when connector dispatch fails', async () => {
+    axios.post.mockRejectedValue(new Error('synthetic connector failure'));
+
+    const response = await request(app)
+      .post('/api/realtime/tool')
+      .set('Authorization', 'Bearer user-token')
+      .set('x-test-user-email', 'owner@example.com')
+      .send({
+        name: 'rm_cancel_appointment',
+        arguments: { appointment_id: 'appointment' },
+        callId: 'realtime-call-2',
       });
 
     expect(response.status).toBe(200);
-    expect(JSON.stringify(logger.warn.mock.calls)).not.toContain('synthetic-action-token');
+    expect(JSON.stringify(logger.warn.mock.calls)).not.toContain('user-token');
   });
 
   test.each([
@@ -205,14 +246,14 @@ describe('realtime MCP authorization', () => {
     expect(axios.post).not.toHaveBeenCalled();
   });
 
-  test('hides and blocks mutations when server authority is unavailable', async () => {
-    delete process.env.RM_TEST_ACTION_TOKEN;
-
+  test('hides and blocks mutations outside a reusable OpenID session', async () => {
     const config = await request(app)
       .get('/api/realtime/config')
+      .set('x-test-provider', 'local')
       .set('x-test-user-email', 'owner@example.com');
     const call = await request(app)
       .post('/api/realtime/tool')
+      .set('x-test-provider', 'local')
       .set('x-test-user-email', 'owner@example.com')
       .send({
         name: 'rm_create_appointment',
@@ -222,20 +263,20 @@ describe('realtime MCP authorization', () => {
     expect(config.body.toolCount).toBe(1);
     expect(call.status).toBe(503);
     expect(axios.post).not.toHaveBeenCalled();
-    process.env.RM_TEST_ACTION_TOKEN = 'synthetic-action-token';
   });
 
-  test('does not expose the action credential in the realtime session payload', async () => {
+  test('does not expose the delegated user token in the realtime session payload', async () => {
     axios.post.mockResolvedValue({ data: { value: 'ephemeral-token' } });
 
     const response = await request(app)
       .post('/api/realtime/session')
+      .set('Authorization', 'Bearer user-token')
       .set('x-test-user-email', 'owner@example.com')
       .send({});
 
     expect(response.status).toBe(200);
     const sessionPayload = axios.post.mock.calls[0][1];
-    expect(JSON.stringify(sessionPayload)).not.toContain('synthetic-action-token');
+    expect(JSON.stringify(sessionPayload)).not.toContain('user-token');
     expect(sessionPayload.session.tools.map((tool) => tool.name)).toEqual([
       'rm_cancel_appointment',
       'rm_create_appointment',
@@ -256,17 +297,12 @@ describe('realtime MCP authorization', () => {
     expect(response.body.filterEvents).toBe(true);
   });
 
-  test('rejects duplicate server and action-token assignments', () => {
+  test('rejects duplicate server assignments', () => {
     expect(
       internals.parseMcpServers(
         'reginamaria=http://one.test,reginamaria=http://two.test,other=http://other.test',
       ),
     ).toEqual([{ name: 'other', url: 'http://other.test' }]);
-    expect([
-      ...internals.parseActionTokenEnvs(
-        'reginamaria=RM_ONE,reginamaria=RM_TWO,other=RM_SHARED,third=RM_SHARED',
-      ),
-    ]).toEqual([]);
   });
 
   test.each([
@@ -274,13 +310,6 @@ describe('realtime MCP authorization', () => {
     ['reginamaria=,reginamaria=http://valid.test'],
   ])('rejects mixed valid and invalid duplicate server assignments: %s', (config) => {
     expect(internals.parseMcpServers(config)).toEqual([]);
-  });
-
-  test.each([
-    ['reginamaria=RM_TOKEN,reginamaria=bad-name'],
-    ['reginamaria=bad-name,reginamaria=RM_TOKEN'],
-  ])('rejects mixed valid and invalid duplicate action mappings: %s', (config) => {
-    expect([...internals.parseActionTokenEnvs(config)]).toEqual([]);
   });
 
   test('suppresses operation IDs owned by more than one server', () => {

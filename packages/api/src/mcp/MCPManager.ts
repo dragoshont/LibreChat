@@ -1,4 +1,5 @@
 import pick from 'lodash/pick';
+import { randomUUID } from 'node:crypto';
 import { logger } from '@librechat/data-schemas';
 import { CallToolResultSchema, ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js';
 import type { RequestOptions } from '@modelcontextprotocol/sdk/shared/protocol.js';
@@ -10,9 +11,17 @@ import type { RequestBody } from '~/types';
 import type * as t from './types';
 import { UserConnectionManager } from '~/mcp/UserConnectionManager';
 import { ConnectionsRepository } from '~/mcp/ConnectionsRepository';
+import { MCPConnectionFactory } from '~/mcp/MCPConnectionFactory';
 import { formatToolContent } from './parsers';
 import { MCPConnection } from './connection';
 import { processMCPEnv } from '~/utils/env';
+
+export function hasRequestScopedHeaders(options: t.MCPOptions): boolean {
+  if (!("headers" in options) || !options.headers) return false;
+  return Object.values(options.headers).some(
+    (value) => /\{\{LIBRECHAT_[A-Z0-9_]+\}\}|\$\{LIBRECHAT_[A-Z0-9_]+\}/.test(value),
+  );
+}
 
 /**
  * Centralized manager for MCP server connections and tool execution.
@@ -198,23 +207,42 @@ Please follow these instructions when using tools from the respective MCP server
   }): Promise<t.FormattedToolResponse> {
     /** User-specific connection */
     let connection: MCPConnection | undefined;
+    let requestScopedConnection = false;
     const userId = user?.id;
     const logPrefix = userId ? `[MCP][User: ${userId}][${serverName}]` : `[MCP][${serverName}]`;
 
     try {
       if (userId && user) this.updateUserLastActivity(userId);
 
-      connection = await this.getConnection({
-        serverName,
+      const rawConfig = this.getRawConfig(serverName) as t.MCPOptions;
+      const currentOptions = processMCPEnv({
         user,
-        flowManager,
-        tokenMethods,
-        oauthStart,
-        oauthEnd,
-        signal: options?.signal,
-        customUserVars,
-        requestBody,
+        options: rawConfig,
+        customUserVars: customUserVars,
+        body: requestBody,
       });
+      requestScopedConnection = hasRequestScopedHeaders(rawConfig);
+      if (requestScopedConnection && 'headers' in currentOptions) {
+        currentOptions.headers = {
+          ...currentOptions.headers,
+          'X-Tessera-Invocation-Id': randomUUID(),
+        };
+      }
+      connection = requestScopedConnection
+        ? await MCPConnectionFactory.create(
+            { serverName, serverConfig: currentOptions },
+          )
+        : await this.getConnection({
+            serverName,
+            user,
+            flowManager,
+            tokenMethods,
+            oauthStart,
+            oauthEnd,
+            signal: options?.signal,
+            customUserVars,
+            requestBody,
+          });
 
       if (!(await connection.isConnected())) {
         /** May happen if getUserConnection failed silently or app connection dropped */
@@ -224,14 +252,7 @@ Please follow these instructions when using tools from the respective MCP server
         );
       }
 
-      const rawConfig = this.getRawConfig(serverName) as t.MCPOptions;
-      const currentOptions = processMCPEnv({
-        user,
-        options: rawConfig,
-        customUserVars: customUserVars,
-        body: requestBody,
-      });
-      if ('headers' in currentOptions) {
+      if (!requestScopedConnection && 'headers' in currentOptions) {
         connection.setRequestHeaders(currentOptions.headers || {});
       }
 
@@ -260,6 +281,10 @@ Please follow these instructions when using tools from the respective MCP server
       logger.error(`${logPrefix}[${toolName}] Tool call failed`, error);
       // Rethrowing allows the caller (createMCPTool) to handle the final user message
       throw error;
+    } finally {
+      if (requestScopedConnection) {
+        await connection?.disconnect().catch(() => undefined);
+      }
     }
   }
 }

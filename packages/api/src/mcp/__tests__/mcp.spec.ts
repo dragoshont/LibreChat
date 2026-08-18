@@ -5,6 +5,8 @@ import {
 } from 'librechat-data-provider';
 import type { TUser } from 'librechat-data-provider';
 import { processMCPEnv } from '~/utils/env';
+import { MCPConnectionFactory } from '~/mcp/MCPConnectionFactory';
+import { MCPManager, hasRequestScopedHeaders } from '~/mcp/MCPManager';
 
 // Helper function to create test user objects
 function createTestUser(
@@ -857,6 +859,99 @@ describe('Environment Variable Extraction (MCP)', () => {
         Authorization: '{{PAT_TOKEN}}', // Should remain unchanged since no customUserVars provided
         'Content-Type': 'application/json',
       });
+    });
+  });
+
+  describe('request-scoped transport detection', () => {
+    it('isolates LibreChat token and user placeholders from shared app connections', () => {
+      expect(hasRequestScopedHeaders({
+        type: 'streamable-http',
+        url: 'https://example.com/mcp',
+          headers: { Authorization: 'Bearer {{LIBRECHAT_OPENID_ACCESS_TOKEN}}' },
+      })).toBe(true);
+      expect(hasRequestScopedHeaders({
+        type: 'streamable-http',
+        url: 'https://example.com/mcp',
+        headers: { 'X-User': '{{LIBRECHAT_USER_ID}}' },
+      })).toBe(true);
+    });
+
+    it('keeps static server credentials on the shared app connection', () => {
+      expect(hasRequestScopedHeaders({
+        type: 'streamable-http',
+        url: 'https://example.com/mcp',
+        headers: { Authorization: 'Bearer static-server-token' },
+      })).toBe(false);
+    });
+
+    it('isolates concurrent user bearers in separate ephemeral transports', async () => {
+      const disconnects: jest.Mock[] = [];
+      const seenHeaders: Array<Record<string, string> | undefined> = [];
+      const create = jest.spyOn(MCPConnectionFactory, 'create').mockImplementation(
+        async (basic) => {
+          const headers = 'headers' in basic.serverConfig
+            ? basic.serverConfig.headers
+            : undefined;
+          seenHeaders.push(headers);
+          const disconnect = jest.fn().mockResolvedValue(undefined);
+          disconnects.push(disconnect);
+          return {
+            isConnected: jest.fn().mockResolvedValue(true),
+            client: {
+              request: jest.fn().mockImplementation(async () => {
+                await new Promise((resolve) => setTimeout(resolve, 5));
+                return { content: [{ type: 'text', text: 'ok' }] };
+              }),
+            },
+            disconnect,
+            timeout: 1000,
+          } as never;
+        },
+      );
+      const manager = new MCPManager({
+        delegated: {
+          type: 'streamable-http',
+          url: 'https://example.com/mcp',
+          headers: { Authorization: 'Bearer {{LIBRECHAT_OPENID_ACCESS_TOKEN}}' },
+        },
+      });
+      const flowManager = {} as never;
+
+      await Promise.all([
+        manager.callTool({
+          user: createTestUser({ id: 'one' }),
+          serverName: 'delegated',
+          toolName: 'write',
+          provider: 'openAI' as never,
+          customUserVars: { LIBRECHAT_OPENID_ACCESS_TOKEN: 'token-one' },
+          flowManager,
+        }),
+        manager.callTool({
+          user: createTestUser({ id: 'two' }),
+          serverName: 'delegated',
+          toolName: 'write',
+          provider: 'openAI' as never,
+          customUserVars: { LIBRECHAT_OPENID_ACCESS_TOKEN: 'token-two' },
+          flowManager,
+        }),
+      ]);
+
+      expect(seenHeaders).toEqual([
+        {
+          Authorization: 'Bearer token-one',
+          'X-Tessera-Invocation-Id': expect.any(String),
+        },
+        {
+          Authorization: 'Bearer token-two',
+          'X-Tessera-Invocation-Id': expect.any(String),
+        },
+      ]);
+      expect(seenHeaders[0]?.['X-Tessera-Invocation-Id']).not.toBe(
+        seenHeaders[1]?.['X-Tessera-Invocation-Id'],
+      );
+      expect(disconnects).toHaveLength(2);
+      expect(disconnects.every((disconnect) => disconnect.mock.calls.length === 1)).toBe(true);
+      create.mockRestore();
     });
   });
 });
