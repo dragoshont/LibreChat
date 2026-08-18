@@ -2,8 +2,16 @@ const express = require('express');
 const axios = require('axios');
 const { randomUUID } = require('crypto');
 const { logger } = require('@librechat/data-schemas');
-const { saveMessage, saveConvo, getMessages, getAllUserMemories, setMemory } = require('~/models');
+const {
+  saveMessage,
+  saveConvo,
+  getMessages,
+  getAllUserMemories,
+  setMemory,
+  getUserById,
+} = require('~/models');
 const { requireJwtAuth } = require('~/server/middleware');
+const { parseGate, isServerAllowedForUser } = require('~/server/utils/mcpUserGate');
 
 /**
  * Realtime voice (WebRTC) routes.
@@ -56,33 +64,83 @@ const REALTIME_CHAT_MODEL = process.env.REALTIME_CHAT_MODEL || 'claude-sonnet-4.
 // POST /api/realtime/tool, and THIS server executes it in-cluster and returns
 // the result. SAFETY: only operationIds in REALTIME_TOOL_ALLOW are advertised,
 // AND a hard mutating-verb deny net blocks any write tool UNLESS it is
-// explicitly opted into REALTIME_MUTATING_ALLOW (a deliberate,
-// confirmation-gated exception — e.g. rm_create_appointment, which the RM MCP
-// refuses unless confirm=true AND the prompt makes the model read back the slot
-// and get a spoken "yes" first).
+// explicitly opted into REALTIME_MUTATING_ALLOW. A mutating tool additionally
+// requires an MCP_USER_GATE entry, an authorized user, and a server-side action
+// credential. Conversational confirmation is UX, not an authorization boundary.
 //   REALTIME_MCP_SERVERS:    comma-separated `name=url[,name=url]`
 //   REALTIME_TOOL_ALLOW:     comma-separated allowed operationIds
 //   REALTIME_MUTATING_ALLOW: comma-separated write tools allowed as exceptions
-const MCP_SERVERS = (process.env.REALTIME_MCP_SERVERS || '')
-  .split(',')
-  .map((s) => s.trim())
-  .filter(Boolean)
-  .map((entry) => {
+//   REALTIME_MCP_ACTION_TOKEN_ENVS: comma-separated `name=ENV_VAR` mappings
+function parseUniqueAssignments(raw, parseValue) {
+  const assignments = new Map();
+  const ambiguous = new Set();
+  const seen = new Set();
+  for (const entry of (raw || '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean)) {
     const idx = entry.indexOf('=');
     if (idx < 0) {
-      return null;
+      continue;
     }
-    const name = entry.slice(0, idx).trim();
-    const url = entry.slice(idx + 1).trim().replace(/\/+$/, '');
-    return name && url ? { name, url } : null;
-  })
-  .filter(Boolean);
+    const key = entry.slice(0, idx).trim();
+    if (!key) {
+      continue;
+    }
+    if (seen.has(key)) {
+      assignments.delete(key);
+      ambiguous.add(key);
+      continue;
+    }
+    seen.add(key);
+    const value = parseValue(entry.slice(idx + 1).trim());
+    if (value == null) {
+      ambiguous.add(key);
+      continue;
+    }
+    assignments.set(key, value);
+  }
+  return assignments;
+}
+
+function parseMcpServers(raw) {
+  return [...parseUniqueAssignments(raw, (value) => value.replace(/\/+$/, '') || null)].map(
+    ([name, url]) => ({ name, url }),
+  );
+}
+
+function parseActionTokenEnvs(raw) {
+  const assignments = parseUniqueAssignments(raw, (value) =>
+    /^[A-Z_][A-Z0-9_]*$/.test(value) ? value : null,
+  );
+  const owners = new Map();
+  const sharedEnvNames = new Set();
+  for (const [serverName, envName] of assignments) {
+    if (owners.has(envName)) {
+      sharedEnvNames.add(envName);
+    } else {
+      owners.set(envName, serverName);
+    }
+  }
+  for (const envName of sharedEnvNames) {
+    assignments.delete(owners.get(envName));
+    for (const [serverName, candidate] of assignments) {
+      if (candidate === envName) {
+        assignments.delete(serverName);
+      }
+    }
+  }
+  return assignments;
+}
+
+const MCP_SERVERS = parseMcpServers(process.env.REALTIME_MCP_SERVERS || '');
 const TOOL_ALLOW = new Set(
   (process.env.REALTIME_TOOL_ALLOW || '').split(',').map((s) => s.trim()).filter(Boolean),
 );
 const MUTATING_ALLOW = new Set(
   (process.env.REALTIME_MUTATING_ALLOW || '').split(',').map((s) => s.trim()).filter(Boolean),
 );
+const ACTION_TOKEN_ENVS = parseActionTokenEnvs(process.env.REALTIME_MCP_ACTION_TOKEN_ENVS || '');
 // Defense-in-depth: never expose a tool whose name contains any of these,
 // regardless of the allow-list, unless it is in MUTATING_ALLOW.
 const DENY_SUBSTR = [
@@ -275,6 +333,50 @@ let toolDispatch = {}; // name -> { url, path }
 let toolsLoaded = false;
 let toolsLoadAttempt = 0;
 
+async function resolveUserEmail(user) {
+  const direct = String(user?.email || '').trim();
+  if (direct) {
+    return direct;
+  }
+  const userId = user?.id || user?._id;
+  if (!userId) {
+    return '';
+  }
+  try {
+    const resolved = await getUserById(userId, 'email');
+    return String(resolved?.email || '').trim();
+  } catch {
+    logger.warn('[realtime] user identity lookup failed');
+    return '';
+  }
+}
+
+function mutationHeaders(target) {
+  if (!target.mutating) {
+    return {};
+  }
+  if (!parseGate().has(target.serverName)) {
+    return null;
+  }
+  const envName = ACTION_TOKEN_ENVS.get(target.serverName);
+  const actionToken = envName ? String(process.env[envName] || '').trim() : '';
+  if (!actionToken) {
+    return null;
+  }
+  return { 'X-Tessera-Action-Token': actionToken };
+}
+
+async function toolsForUser(user) {
+  const email = await resolveUserEmail(user);
+  return toolDefs.filter((definition) => {
+    const target = toolDispatch[definition.name];
+    if (!target || !isServerAllowedForUser(target.serverName, email)) {
+      return false;
+    }
+    return mutationHeaders(target) !== null;
+  });
+}
+
 // Azure's realtime function-tool validator is STRICT: it 500s on `anyOf` and on
 // `additionalProperties: true` in a tool's parameter schema (verified live).
 // FastAPI/Pydantic emit exactly those for optional/open bodies (e.g. RM wraps
@@ -348,7 +450,7 @@ function coerceText(d) {
   return '';
 }
 
-async function loadOneServer(url) {
+async function loadOneServer(serverName, url) {
   const r = await axios.get(`${url}/openapi.json`, { timeout: 10000 });
   const spec = r.data || {};
   const defs = [];
@@ -379,9 +481,37 @@ async function loadOneServer(url) {
     params.additionalProperties = false;
     const desc = (post.summary || post.description || tname).trim().slice(0, 300);
     defs.push({ type: 'function', name: tname, description: desc, parameters: params });
-    dispatch[tname] = { url, path };
+    dispatch[tname] = {
+      serverName,
+      url,
+      path,
+      mutating: MUTATING_ALLOW.has(tname),
+    };
   }
   return { defs, dispatch };
+}
+
+function mergeLoadedTools(loadedServers) {
+  const definitions = new Map();
+  const dispatch = {};
+  const ambiguous = new Set();
+  for (const loaded of loadedServers) {
+    for (const definition of loaded.defs) {
+      const name = definition.name;
+      if (ambiguous.has(name)) {
+        continue;
+      }
+      if (definitions.has(name)) {
+        definitions.delete(name);
+        delete dispatch[name];
+        ambiguous.add(name);
+        continue;
+      }
+      definitions.set(name, definition);
+      dispatch[name] = loaded.dispatch[name];
+    }
+  }
+  return { defs: [...definitions.values()], dispatch };
 }
 
 // Lazy, throttled load with last-good caching: a transient blip never drops a
@@ -397,38 +527,62 @@ async function loadTools(force = false) {
     return;
   }
   toolsLoadAttempt = nowMs;
-  const defs = [];
-  const dispatch = {};
+  const loadedServers = [];
+  let complete = true;
   for (const { name, url } of MCP_SERVERS) {
     try {
-      const loaded = await loadOneServer(url);
-      for (const d of loaded.defs) {
-        if (!dispatch[d.name]) {
-          defs.push(d);
-        }
-      }
-      Object.assign(dispatch, loaded.dispatch);
+      const loaded = await loadOneServer(name, url);
+      loadedServers.push(loaded);
       logger.info(`[realtime] MCP ${name}: loaded ${loaded.defs.length} tool(s)`);
     } catch (err) {
+      complete = false;
       logger.warn(`[realtime] MCP load failed for ${name}: ${err.message}`);
     }
   }
-  if (defs.length || !toolsLoaded) {
-    toolDefs = defs.slice(0, TOOL_MAX);
-    toolDispatch = dispatch;
+  if (!complete) {
+    if (!toolsLoaded) {
+      toolDefs = [];
+      toolDispatch = {};
+    }
+    toolsLoaded = true;
+    return;
   }
+  const merged = mergeLoadedTools(loadedServers);
+  toolDefs = merged.defs.slice(0, TOOL_MAX);
+  toolDispatch = Object.fromEntries(
+    toolDefs.map((definition) => [definition.name, merged.dispatch[definition.name]]),
+  );
   toolsLoaded = true;
+}
+
+if (process.env.NODE_ENV === 'test') {
+  router._test = {
+    parseMcpServers,
+    parseActionTokenEnvs,
+    mergeLoadedTools,
+    loadTools,
+    resetTools() {
+      toolDefs = [];
+      toolDispatch = {};
+      toolsLoaded = false;
+      toolsLoadAttempt = 0;
+    },
+    toolState() {
+      return { definitions: toolDefs.slice(), dispatch: { ...toolDispatch } };
+    },
+  };
 }
 
 router.get('/config', async (req, res) => {
   if (isEnabled()) {
     await loadTools().catch(() => {});
   }
+  const tools = await toolsForUser(req.user);
   res.json({
     enabled: isEnabled(),
     deployment: AZURE_REALTIME_DEPLOYMENT,
     voice: REALTIME_VOICE,
-    toolCount: toolDefs.length + (MEMORY_ENABLED ? 1 : 0) + (WEB_SEARCH_ENABLED ? 1 : 0),
+    toolCount: tools.length + (MEMORY_ENABLED ? 1 : 0) + (WEB_SEARCH_ENABLED ? 1 : 0),
     memory: MEMORY_ENABLED,
   });
 });
@@ -485,7 +639,7 @@ router.post('/session', async (req, res) => {
   // can reuse (the accumulating audio context is never cacheable). MCP discovery
   // order must not perturb it, so sort by name. Memory + web-search tools are
   // appended in a fixed order after.
-  const tools = toolDefs
+  const tools = (await toolsForUser(req.user))
     .slice()
     .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
   if (MEMORY_ENABLED) {
@@ -587,6 +741,14 @@ router.post('/tool', async (req, res) => {
   if (!target) {
     return res.status(400).json({ output: `Unknown tool: ${name}` });
   }
+  const email = await resolveUserEmail(req.user);
+  if (!isServerAllowedForUser(target.serverName, email)) {
+    return res.status(403).json({ output: 'That tool is not available for this user.' });
+  }
+  const actionHeaders = mutationHeaders(target);
+  if (actionHeaders === null) {
+    return res.status(503).json({ output: 'That mutation is not configured.' });
+  }
   if (typeof args === 'string') {
     try {
       args = args.trim() ? JSON.parse(args) : {};
@@ -599,7 +761,7 @@ router.post('/tool', async (req, res) => {
   }
   try {
     const r = await axios.post(`${target.url}${target.path}`, args, {
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...actionHeaders },
       timeout: 20000,
     });
     const text = coerceText(r.data);
