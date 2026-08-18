@@ -884,6 +884,25 @@ describe('Environment Variable Extraction (MCP)', () => {
       })).toBe(false);
     });
 
+    it('fails closed when request-scoped identity has no stable invocation ID', async () => {
+      const manager = new MCPManager({
+        delegated: {
+          type: 'streamable-http',
+          url: 'https://example.com/mcp',
+          headers: { Authorization: 'Bearer {{LIBRECHAT_OPENID_ACCESS_TOKEN}}' },
+        },
+      });
+
+      await expect(manager.callTool({
+        user: createTestUser({ id: 'owner' }),
+        serverName: 'delegated',
+        toolName: 'write',
+        provider: 'openAI' as never,
+        customUserVars: { LIBRECHAT_OPENID_ACCESS_TOKEN: 'owner-token' },
+        flowManager: {} as never,
+      })).rejects.toThrow('Stable MCP invocation ID is required');
+    });
+
     it('isolates concurrent user bearers in separate ephemeral transports', async () => {
       const disconnects: jest.Mock[] = [];
       const seenHeaders: Array<Record<string, string> | undefined> = [];
@@ -924,6 +943,7 @@ describe('Environment Variable Extraction (MCP)', () => {
           toolName: 'write',
           provider: 'openAI' as never,
           customUserVars: { LIBRECHAT_OPENID_ACCESS_TOKEN: 'token-one' },
+          invocationId: 'logical-tool-call-one',
           flowManager,
         }),
         manager.callTool({
@@ -932,6 +952,7 @@ describe('Environment Variable Extraction (MCP)', () => {
           toolName: 'write',
           provider: 'openAI' as never,
           customUserVars: { LIBRECHAT_OPENID_ACCESS_TOKEN: 'token-two' },
+          invocationId: 'logical-tool-call-two',
           flowManager,
         }),
       ]);
@@ -939,11 +960,11 @@ describe('Environment Variable Extraction (MCP)', () => {
       expect(seenHeaders).toEqual([
         {
           Authorization: 'Bearer token-one',
-          'X-Tessera-Invocation-Id': expect.any(String),
+          'X-Tessera-Invocation-Id': 'logical-tool-call-one',
         },
         {
           Authorization: 'Bearer token-two',
-          'X-Tessera-Invocation-Id': expect.any(String),
+          'X-Tessera-Invocation-Id': 'logical-tool-call-two',
         },
       ]);
       expect(seenHeaders[0]?.['X-Tessera-Invocation-Id']).not.toBe(

@@ -1,5 +1,4 @@
 import pick from 'lodash/pick';
-import { randomUUID } from 'node:crypto';
 import { logger } from '@librechat/data-schemas';
 import { CallToolResultSchema, ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js';
 import type { RequestOptions } from '@modelcontextprotocol/sdk/shared/protocol.js';
@@ -191,6 +190,7 @@ Please follow these instructions when using tools from the respective MCP server
     oauthStart,
     oauthEnd,
     customUserVars,
+    invocationId,
   }: {
     user?: TUser;
     serverName: string;
@@ -201,6 +201,7 @@ Please follow these instructions when using tools from the respective MCP server
     requestBody?: RequestBody;
     tokenMethods?: TokenMethods;
     customUserVars?: Record<string, string>;
+    invocationId?: string;
     flowManager: FlowStateManager<MCPOAuthTokens | null>;
     oauthStart?: (authURL: string) => Promise<void>;
     oauthEnd?: () => Promise<void>;
@@ -223,9 +224,12 @@ Please follow these instructions when using tools from the respective MCP server
       });
       requestScopedConnection = hasRequestScopedHeaders(rawConfig);
       if (requestScopedConnection && 'headers' in currentOptions) {
+        if (!invocationId || !/^[!-~]{1,128}$/.test(invocationId)) {
+          throw new McpError(ErrorCode.InvalidRequest, 'Stable MCP invocation ID is required');
+        }
         currentOptions.headers = {
           ...currentOptions.headers,
-          'X-Tessera-Invocation-Id': randomUUID(),
+          'X-Tessera-Invocation-Id': invocationId,
         };
       }
       connection = requestScopedConnection
