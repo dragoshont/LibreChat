@@ -9,8 +9,6 @@ const { CacheKeys, ErrorTypes } = require('librechat-data-provider');
 const { Strategy: OpenIDStrategy } = require('openid-client/passport');
 const {
   isEnabled,
-  logHeaders,
-  safeStringify,
   findOpenIDUser,
   getBalanceConfig,
   isEmailDomainAllowed,
@@ -19,6 +17,10 @@ const { getStrategyFunctions } = require('~/server/services/Files/strategies');
 const { findUser, createUser, updateUser } = require('~/models');
 const { getAppConfig } = require('~/server/services/Config');
 const getLogStores = require('~/cache/getLogStores');
+const {
+  formatOpenIdBodyForLogging,
+  formatOpenIdHeadersForLogging,
+} = require('~/server/utils/openIdLogging');
 
 /**
  * @typedef {import('openid-client').ClientMetadata} ClientMetadata
@@ -35,17 +37,13 @@ async function customFetch(url, options) {
   const debugOpenId = isEnabled(process.env.DEBUG_OPENID_REQUESTS);
   if (debugOpenId) {
     logger.debug(`[openidStrategy] Request method: ${options.method || 'GET'}`);
-    logger.debug(`[openidStrategy] Request headers: ${logHeaders(options.headers)}`);
+    logger.debug(
+      `[openidStrategy] Request headers: ${formatOpenIdHeadersForLogging(options.headers)}`,
+    );
     if (options.body) {
-      let bodyForLogging = '';
-      if (options.body instanceof URLSearchParams) {
-        bodyForLogging = options.body.toString();
-      } else if (typeof options.body === 'string') {
-        bodyForLogging = options.body;
-      } else {
-        bodyForLogging = safeStringify(options.body);
-      }
-      logger.debug(`[openidStrategy] Request body: ${bodyForLogging}`);
+      logger.debug(
+        `[openidStrategy] Request body: ${formatOpenIdBodyForLogging(options.body)}`,
+      );
     }
   }
 
@@ -64,7 +62,9 @@ async function customFetch(url, options) {
 
     if (debugOpenId) {
       logger.debug(`[openidStrategy] Response status: ${response.status} ${response.statusText}`);
-      logger.debug(`[openidStrategy] Response headers: ${logHeaders(response.headers)}`);
+      logger.debug(
+        `[openidStrategy] Response headers: ${formatOpenIdHeadersForLogging(response.headers)}`,
+      );
     }
 
     if (response.status === 200 && response.headers.has('www-authenticate')) {
