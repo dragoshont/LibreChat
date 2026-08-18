@@ -39,6 +39,7 @@ function parseGate(raw = process.env.MCP_USER_GATE || '') {
     return _cache;
   }
   const map = new Map();
+  const ambiguous = new Set();
   for (const entry of raw.split(';')) {
     const trimmed = entry.trim();
     if (!trimmed) {
@@ -54,6 +55,11 @@ function parseGate(raw = process.env.MCP_USER_GATE || '') {
       .split(',')
       .map((e) => e.trim().toLowerCase())
       .filter(Boolean);
+    if (server && (ambiguous.has(server) || map.has(server))) {
+      map.set(server, new Set());
+      ambiguous.add(server);
+      continue;
+    }
     if (server && emails.length) {
       map.set(server, new Set(emails));
     }
