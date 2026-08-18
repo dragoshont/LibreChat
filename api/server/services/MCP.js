@@ -23,6 +23,7 @@ const {
 const { getMCPManager, getFlowStateManager, getOAuthReconnectionManager } = require('~/config');
 const { findToken, createToken, updateToken, getUserById } = require('~/models');
 const { isServerAllowedForUser } = require('~/server/utils/mcpUserGate');
+const { deriveMCPInvocationId } = require('~/server/utils/mcpInvocationId');
 const { reinitMCPServer } = require('./Tools/mcp');
 const { getAppConfig } = require('./Config');
 const { getLogStores } = require('~/cache');
@@ -356,6 +357,11 @@ function createToolInstance({ res, toolName, serverName, toolDefinition, provide
       const provider = (config?.metadata?.provider || _provider)?.toLowerCase();
 
       const { args: _args, stepId, ...toolCall } = config.toolCall ?? {};
+      const invocationId = deriveMCPInvocationId({
+        threadId: config.metadata?.thread_id,
+        runId: config.metadata?.run_id,
+        toolCallId: toolCall.id,
+      });
       const flowId = `${serverName}:oauth_login:${config.metadata.thread_id}:${config.metadata.run_id}`;
       const runStepDeltaEmitter = createRunStepDeltaEmitter({
         res,
@@ -400,6 +406,7 @@ function createToolInstance({ res, toolName, serverName, toolDefinition, provide
         user: config?.configurable?.user,
         requestBody: config?.configurable?.requestBody,
         customUserVars,
+        invocationId,
         flowManager,
         tokenMethods: {
           findToken,

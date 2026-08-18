@@ -292,7 +292,11 @@ export default function useRealtimeVoice({
     }
     let output = '';
     try {
-      const res = (await request.post('/api/realtime/tool', { name, arguments: args })) as {
+      const res = (await request.post('/api/realtime/tool', {
+        name,
+        arguments: args,
+        callId,
+      })) as {
         output?: string;
       };
       output = res?.output || '';

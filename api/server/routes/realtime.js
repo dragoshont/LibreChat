@@ -65,12 +65,14 @@ const REALTIME_CHAT_MODEL = process.env.REALTIME_CHAT_MODEL || 'claude-sonnet-4.
 // the result. SAFETY: only operationIds in REALTIME_TOOL_ALLOW are advertised,
 // AND a hard mutating-verb deny net blocks any write tool UNLESS it is
 // explicitly opted into REALTIME_MUTATING_ALLOW. A mutating tool additionally
-// requires an MCP_USER_GATE entry, an authorized user, and a server-side action
-// credential. Conversational confirmation is UX, not an authorization boundary.
+// requires an MCP_USER_GATE entry, an authorized OpenID user, and an explicitly
+// delegated server. The user's bearer is forwarded only for that mutation; no RM
+// action credential exists in LibreChat. Conversational confirmation is UX, not
+// an authorization boundary.
 //   REALTIME_MCP_SERVERS:    comma-separated `name=url[,name=url]`
 //   REALTIME_TOOL_ALLOW:     comma-separated allowed operationIds
 //   REALTIME_MUTATING_ALLOW: comma-separated write tools allowed as exceptions
-//   REALTIME_MCP_ACTION_TOKEN_ENVS: comma-separated `name=ENV_VAR` mappings
+//   REALTIME_MCP_USER_AUTH_SERVERS: comma-separated servers receiving user auth
 function parseUniqueAssignments(raw, parseValue) {
   const assignments = new Map();
   const ambiguous = new Set();
@@ -109,30 +111,6 @@ function parseMcpServers(raw) {
   );
 }
 
-function parseActionTokenEnvs(raw) {
-  const assignments = parseUniqueAssignments(raw, (value) =>
-    /^[A-Z_][A-Z0-9_]*$/.test(value) ? value : null,
-  );
-  const owners = new Map();
-  const sharedEnvNames = new Set();
-  for (const [serverName, envName] of assignments) {
-    if (owners.has(envName)) {
-      sharedEnvNames.add(envName);
-    } else {
-      owners.set(envName, serverName);
-    }
-  }
-  for (const envName of sharedEnvNames) {
-    assignments.delete(owners.get(envName));
-    for (const [serverName, candidate] of assignments) {
-      if (candidate === envName) {
-        assignments.delete(serverName);
-      }
-    }
-  }
-  return assignments;
-}
-
 const MCP_SERVERS = parseMcpServers(process.env.REALTIME_MCP_SERVERS || '');
 const TOOL_ALLOW = new Set(
   (process.env.REALTIME_TOOL_ALLOW || '').split(',').map((s) => s.trim()).filter(Boolean),
@@ -140,7 +118,12 @@ const TOOL_ALLOW = new Set(
 const MUTATING_ALLOW = new Set(
   (process.env.REALTIME_MUTATING_ALLOW || '').split(',').map((s) => s.trim()).filter(Boolean),
 );
-const ACTION_TOKEN_ENVS = parseActionTokenEnvs(process.env.REALTIME_MCP_ACTION_TOKEN_ENVS || '');
+const USER_AUTH_SERVERS = new Set(
+  (process.env.REALTIME_MCP_USER_AUTH_SERVERS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean),
+);
 // Defense-in-depth: never expose a tool whose name contains any of these,
 // regardless of the allow-list, unless it is in MUTATING_ALLOW.
 const DENY_SUBSTR = [
@@ -351,29 +334,62 @@ async function resolveUserEmail(user) {
   }
 }
 
-function mutationHeaders(target) {
+function forwardableOpenIdToken(req) {
+  const reuse = String(process.env.OPENID_REUSE_TOKENS || '').toLowerCase();
+  if (req?.user?.provider !== 'openid' || (reuse !== 'true' && reuse !== '1')) {
+    return '';
+  }
+  const values = [];
+  for (let index = 0; index < (req?.rawHeaders?.length || 0); index += 2) {
+    if (String(req.rawHeaders[index]).toLowerCase() === 'authorization') {
+      values.push(req.rawHeaders[index + 1]);
+    }
+  }
+  if (values.length !== 1) {
+    return '';
+  }
+  const match = /^Bearer\s+([^\s,]+)$/i.exec(values[0] || '');
+  return match ? match[1].trim() : '';
+}
+
+function validInvocationId(value) {
+  return typeof value === 'string'
+    && value.length > 0
+    && value.length <= 128
+    && /^[!-~]+$/.test(value);
+}
+
+function mutationHeaders(target, req, invocationId, requireInvocation = false) {
   if (!target.mutating) {
     return {};
   }
-  if (!parseGate().has(target.serverName)) {
+  if (!parseGate().has(target.serverName) || !USER_AUTH_SERVERS.has(target.serverName)) {
     return null;
   }
-  const envName = ACTION_TOKEN_ENVS.get(target.serverName);
-  const actionToken = envName ? String(process.env[envName] || '').trim() : '';
-  if (!actionToken) {
+  const userToken = forwardableOpenIdToken(req);
+  if (!userToken) {
     return null;
   }
-  return { 'X-Tessera-Action-Token': actionToken };
+  if (!requireInvocation) {
+    return { Authorization: `Bearer ${userToken}` };
+  }
+  if (!validInvocationId(invocationId)) {
+    return null;
+  }
+  return {
+    Authorization: `Bearer ${userToken}`,
+    'X-Tessera-Invocation-Id': invocationId,
+  };
 }
 
-async function toolsForUser(user) {
-  const email = await resolveUserEmail(user);
+async function toolsForUser(req) {
+  const email = await resolveUserEmail(req.user);
   return toolDefs.filter((definition) => {
     const target = toolDispatch[definition.name];
     if (!target || !isServerAllowedForUser(target.serverName, email)) {
       return false;
     }
-    return mutationHeaders(target) !== null;
+    return mutationHeaders(target, req) !== null;
   });
 }
 
@@ -558,7 +574,6 @@ async function loadTools(force = false) {
 if (process.env.NODE_ENV === 'test') {
   router._test = {
     parseMcpServers,
-    parseActionTokenEnvs,
     mergeLoadedTools,
     loadTools,
     resetTools() {
@@ -577,7 +592,7 @@ router.get('/config', async (req, res) => {
   if (isEnabled()) {
     await loadTools().catch(() => {});
   }
-  const tools = await toolsForUser(req.user);
+  const tools = await toolsForUser(req);
   res.json({
     enabled: isEnabled(),
     deployment: AZURE_REALTIME_DEPLOYMENT,
@@ -639,7 +654,7 @@ router.post('/session', async (req, res) => {
   // can reuse (the accumulating audio context is never cacheable). MCP discovery
   // order must not perturb it, so sort by name. Memory + web-search tools are
   // appended in a fixed order after.
-  const tools = (await toolsForUser(req.user))
+  const tools = (await toolsForUser(req))
     .slice()
     .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
   if (MEMORY_ENABLED) {
@@ -698,7 +713,7 @@ router.post('/tool', async (req, res) => {
     return res.status(501).json({ output: 'Voice is not configured on this server.' });
   }
   await loadTools().catch(() => {});
-  let { name, arguments: args } = req.body || {};
+  let { name, arguments: args, callId } = req.body || {};
   // Built-in memory tool (not an MCP server): write to the user's native store.
   if (name === 'memory_save') {
     if (!MEMORY_ENABLED) {
@@ -745,7 +760,7 @@ router.post('/tool', async (req, res) => {
   if (!isServerAllowedForUser(target.serverName, email)) {
     return res.status(403).json({ output: 'That tool is not available for this user.' });
   }
-  const actionHeaders = mutationHeaders(target);
+  const actionHeaders = mutationHeaders(target, req, callId, target.mutating);
   if (actionHeaders === null) {
     return res.status(503).json({ output: 'That mutation is not configured.' });
   }
@@ -762,7 +777,7 @@ router.post('/tool', async (req, res) => {
   try {
     const r = await axios.post(`${target.url}${target.path}`, args, {
       headers: { 'Content-Type': 'application/json', ...actionHeaders },
-      timeout: 20000,
+      timeout: target.mutating ? 70000 : 20000,
     });
     const text = coerceText(r.data);
     return res.json({ output: (text || '').slice(0, TOOL_CALL_CHARS) || 'No data returned.' });

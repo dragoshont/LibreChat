@@ -36,10 +36,18 @@ const openIdJwtLogin = (openIdConfig) => {
     jwksRsaOptions.requestAgent = new HttpsProxyAgent(process.env.PROXY);
   }
 
+  const issuer = openIdConfig.serverMetadata().issuer;
+  const audience = openIdConfig.clientMetadata().client_id;
+  if (!issuer || !audience) {
+    throw new Error('OpenID JWT validation requires the configured issuer and client audience');
+  }
+
   return new JwtStrategy(
     {
       jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
       secretOrKeyProvider: jwksRsa.passportJwtSecret(jwksRsaOptions),
+      issuer,
+      audience,
     },
     /**
      * @param {import('openid-client').IDToken} payload
