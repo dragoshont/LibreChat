@@ -359,8 +359,7 @@ function createToolInstance({ res, toolName, serverName, toolDefinition, provide
       const { args: _args, stepId, ...toolCall } = config.toolCall ?? {};
       const invocationId = deriveMCPInvocationId({
         threadId: config.metadata?.thread_id,
-        runId: config.metadata?.run_id,
-        toolCallId: toolCall.id,
+        parentMessageId: config.configurable?.requestBody?.parentMessageId,
       });
       const flowId = `${serverName}:oauth_login:${config.metadata.thread_id}:${config.metadata.run_id}`;
       const runStepDeltaEmitter = createRunStepDeltaEmitter({

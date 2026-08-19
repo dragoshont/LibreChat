@@ -547,6 +547,7 @@ describe('BaseClient', () => {
       expect(currentMessages2[currentMessages2.length - 1].messageId).toEqual(
         overrideParentMessageId,
       );
+      expect(TestClient.parentMessageId).toEqual(overrideParentMessageId);
     });
 
     test('setOptions is called with the correct arguments only when replaceOptions is set to true', async () => {
