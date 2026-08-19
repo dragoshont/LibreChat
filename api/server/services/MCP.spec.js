@@ -91,6 +91,14 @@ jest.mock('~/models', () => ({
   updateToken: jest.fn(),
 }));
 
+jest.mock('~/server/utils/mcpUserGate', () => ({
+  isServerAllowedForUser: jest.fn(() => true),
+}));
+
+jest.mock('~/server/utils/mcpInvocationId', () => ({
+  deriveMCPInvocationId: jest.fn(() => 'stable-invocation-id'),
+}));
+
 jest.mock('./Tools/mcp', () => ({
   reinitMCPServer: jest.fn(),
 }));
@@ -759,6 +767,80 @@ describe('User parameter passing tests', () => {
 
       // Verify reinitMCPServer was NOT called since tool was in cache
       expect(mockReinitMCPServer).not.toHaveBeenCalled();
+    });
+
+    it('should derive the invocation ID from the stable user message', async () => {
+      const mockUser = { id: 'test-user-901', email: 'owner@example.com' };
+      const callTool = jest.fn().mockResolvedValue(['ok']);
+      require('~/config').getMCPManager.mockReturnValue({ callTool });
+      const toolInstance = await createMCPTool({
+        res: { write: jest.fn(), flush: jest.fn() },
+        user: mockUser,
+        toolKey: 'test-tool::test-server',
+        provider: 'openai',
+        userMCPAuthMap: {},
+        availableTools: {
+          'test-tool::test-server': {
+            function: { description: 'Cached tool', parameters: { type: 'object' } },
+          },
+        },
+      });
+
+      await toolInstance._call(
+        {},
+        {
+          configurable: {
+            user: mockUser,
+            requestBody: { parentMessageId: 'user-message-1' },
+          },
+          metadata: { provider: 'openai', thread_id: 'thread-1', run_id: 'regenerated-run' },
+          toolCall: { id: 'regenerated-call', stepId: 'step-1' },
+        },
+      );
+
+      expect(require('~/server/utils/mcpInvocationId').deriveMCPInvocationId).toHaveBeenCalledWith({
+        threadId: 'thread-1',
+        parentMessageId: 'user-message-1',
+      });
+      expect(callTool).toHaveBeenCalledWith(
+        expect.objectContaining({ invocationId: 'stable-invocation-id' }),
+      );
+    });
+
+    it('should pass no invocation ID when stable message context is absent', async () => {
+      const mockUser = { id: 'test-user-902', email: 'owner@example.com' };
+      const callTool = jest.fn().mockResolvedValue(['ok']);
+      require('~/config').getMCPManager.mockReturnValue({ callTool });
+      require('~/server/utils/mcpInvocationId').deriveMCPInvocationId.mockReturnValueOnce(
+        undefined,
+      );
+      const toolInstance = await createMCPTool({
+        res: { write: jest.fn(), flush: jest.fn() },
+        user: mockUser,
+        toolKey: 'test-tool::test-server',
+        provider: 'openai',
+        userMCPAuthMap: {},
+        availableTools: {
+          'test-tool::test-server': {
+            function: { description: 'Cached tool', parameters: { type: 'object' } },
+          },
+        },
+      });
+
+      await toolInstance._call(
+        {},
+        {
+          configurable: { user: mockUser },
+          metadata: { provider: 'openai', thread_id: 'thread-1', run_id: 'run-1' },
+          toolCall: { id: 'call-1', stepId: 'step-1' },
+        },
+      );
+
+      expect(require('~/server/utils/mcpInvocationId').deriveMCPInvocationId).toHaveBeenCalledWith({
+        threadId: 'thread-1',
+        parentMessageId: undefined,
+      });
+      expect(callTool).toHaveBeenCalledWith(expect.objectContaining({ invocationId: undefined }));
     });
   });
 
