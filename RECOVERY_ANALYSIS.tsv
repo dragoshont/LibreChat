@@ -1,0 +1,2 @@
+worktree	branch	classification	decision	tracked_changes	untracked_entries	note
+/Users/dragoshont/Repo/LibreChat	feat/realtime-voice	DOCUMENTATION	SNAPSHOT	0	4	excluded disposable paths: src/tessera-chat/.swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata, src/tessera-chat/.swiftpm/xcode/package.xcworkspace/xcuserdata/dragoshont.xcuserdatad/UserInterfaceState.xcuserstate
